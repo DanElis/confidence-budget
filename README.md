@@ -1,6 +1,7 @@
 # Бюджет уверенности: совместный выбор шага перепланирования и маски в чанкинге реального времени
 
 Код проверки гипотезы H1: [experiments/h1](experiments/h1).
+Замкнутый контур на LIBERO / LIBERO-Pro: [experiments/libero_pro](experiments/libero_pro).
 
 ## 1. Мотивация
 
