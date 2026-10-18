@@ -59,14 +59,16 @@ def mean_key(run: dict, key: str) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def main(argv=None) -> None:
-    args = parse_args(argv)
-    ref_dir = args.ref or args.runs[0]
-    runs = [ref_dir] + [r for r in args.runs if r != ref_dir]
-    if args.suites:
-        suites = [s.strip() for s in args.suites.split(",") if s.strip()]
-    else:
-        suites = sorted(p.stem for p in ref_dir.glob("*.json") if p.stem not in ("config",) and not p.stem.endswith("_chunks"))
+def all_suites(run: Path) -> list[str]:
+    return sorted(p.stem for p in run.glob("*.json") if p.stem != "config" and not p.stem.endswith("_chunks"))
+
+
+def build_table(runs: list[Path], ref_dir: Path, suites: list[str] | None = None, n_boot: int = 2000,
+                seed: int = 0, labels: dict | None = None) -> str:
+    """Markdown table; ``runs`` may include ``ref_dir`` or not, the reference row comes first."""
+    runs = [ref_dir] + [r for r in runs if r != ref_dir]
+    suites = suites or all_suites(ref_dir)
+    labels = labels or {}
     data = {r: load_run(r, suites) for r in runs}
     ref_eps = episode_table(data[ref_dir])
 
@@ -82,15 +84,22 @@ def main(argv=None) -> None:
             delta = "—"
             pairs = len(ref_eps)
         else:
-            m, lo, hi, pairs = paired_diff(ref_eps, episode_table(run), args.n_boot, args.seed)
+            m, lo, hi, pairs = paired_diff(ref_eps, episode_table(run), n_boot, seed)
             delta = f"{100 * m:+.1f} [{100 * lo:+.1f}; {100 * hi:+.1f}]"
         jumps = [run[s].get("jump_at_switch", float("nan")) for s in suites if s in run]
-        lines.append("| " + " | ".join([r.name] + [f"{x:.1f}" for x in rates] +
+        lines.append("| " + " | ".join([labels.get(r, r.name)] + [f"{x:.1f}" for x in rates] +
                                        [f"{np.mean(valid):.1f}" if valid else "—", delta, str(pairs),
                                         f"{mean_key(run, 'n_inference'):.1f}", f"{mean_key(run, 'sparc'):.3f}",
                                         f"{np.nanmean(jumps):.4f}" if jumps else "—",
                                         f"{mean_key(run, 'mean_stride'):.1f}"]) + " |")
-    table = "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n"
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    ref_dir = args.ref or args.runs[0]
+    suites = [s.strip() for s in args.suites.split(",") if s.strip()] if args.suites else None
+    table = build_table(args.runs, ref_dir, suites, args.n_boot, args.seed)
     print(table)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
