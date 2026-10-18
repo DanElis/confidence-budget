@@ -46,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--policy", default="lerobot/pi05_libero_finetuned", help="PI0.5 checkpoint (Hub id or path)")
     p.add_argument("--dataset", default="HuggingFaceVLA/libero", help="LeRobot dataset repo id")
     p.add_argument("--dataset-root", default=None, help="local dataset root, if already downloaded")
+    p.add_argument("--full-dataset", action="store_true",
+                   help="load every data file instead of only the selected episodes")
     p.add_argument("--episodes", type=int, default=100, help="number of episodes to sample")
     p.add_argument("--episode-ids", type=int, nargs="*", default=None, help="explicit episode ids (overrides --episodes)")
     p.add_argument("--max-chunks", type=int, default=None, help="recorded chunks per episode (default: all)")
@@ -76,21 +78,76 @@ def load_policy(path: str, device: str):
     return policy
 
 
-def episode_rows(dataset) -> dict[int, dict[int, int]]:
-    """Map episode -> frame_index -> row of the (episode-filtered) dataset."""
+def episode_rows(dataset) -> tuple[dict[int, dict[int, int]], np.ndarray]:
+    """Map episode -> frame_index -> row of the loaded dataset; also return the global ``index`` column."""
     table = dataset.hf_dataset.data
     episodes = table.column("episode_index").to_numpy()
     frames = table.column("frame_index").to_numpy()
     rows: dict[int, dict[int, int]] = {}
     for row, (ep, fr) in enumerate(zip(episodes.tolist(), frames.tolist(), strict=True)):
         rows.setdefault(int(ep), {})[int(fr)] = row
-    return rows
+    return rows, table.column("index").to_numpy()
+
+
+def check_episodes(rows, index, meta, episode_ids, filtered: bool) -> list[str]:
+    """Problems that would make LeRobot's action windows wrong for the selected episodes.
+
+    LeRobot builds the future-action window from ``dataset_from_index`` /
+    ``dataset_to_index`` in the metadata, so the loaded rows must agree with it.
+    """
+    problems = []
+    for ep in episode_ids:
+        info = meta.episodes[ep]
+        length, start = int(info["length"]), int(info["dataset_from_index"])
+        frames = rows.get(ep)
+        if not frames:
+            problems.append(f"episode {ep}: no rows in the loaded data")
+            continue
+        if sorted(frames) != list(range(length)):
+            problems.append(f"episode {ep}: {len(frames)} frames loaded, metadata says {length}")
+            continue
+        row_ids = np.array([frames[f] for f in range(length)])
+        if not np.array_equal(index[row_ids], start + np.arange(length)):
+            problems.append(f"episode {ep}: global index disagrees with metadata")
+        elif not filtered and not np.array_equal(row_ids, index[row_ids]):
+            problems.append(f"episode {ep}: row order differs from the global index")
+    return problems
+
+
+def load_dataset(args, meta, episode_ids, delta_timestamps):
+    """Load only the selected episodes; fall back to the full dataset if the metadata is inconsistent.
+
+    Some converted datasets (e.g. HuggingFaceVLA/libero at the time of writing)
+    map episodes to the wrong parquet files, so the per-episode download finds
+    no rows. Loading every file avoids the mapping.
+    """
+    from lerobot.datasets import LeRobotDataset
+
+    if not args.full_dataset:
+        try:
+            dataset = LeRobotDataset(args.dataset, root=args.dataset_root, episodes=episode_ids,
+                                     delta_timestamps=delta_timestamps)
+            rows, index = episode_rows(dataset)
+            problems = check_episodes(rows, index, meta, episode_ids, filtered=True)
+            if not problems:
+                return dataset, rows
+            log.warning("per-episode loading is inconsistent: %s", "; ".join(problems[:3]))
+        except ValueError as err:  # e.g. 'Instruction "train" corresponds to no data!'
+            log.warning("per-episode loading failed: %s", err)
+        log.warning("falling back to the full dataset (downloads every data file once)")
+    dataset = LeRobotDataset(args.dataset, root=args.dataset_root, delta_timestamps=delta_timestamps,
+                             force_cache_sync=True)
+    rows, index = episode_rows(dataset)
+    problems = check_episodes(rows, index, meta, episode_ids, filtered=False)
+    if problems:
+        raise SystemExit("dataset is inconsistent with its metadata:\n" + "\n".join(problems[:10]))
+    return dataset, rows
 
 
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata, resolve_delta_timestamps
+    from lerobot.datasets import LeRobotDatasetMetadata, resolve_delta_timestamps
     from lerobot.policies import make_pre_post_processors
 
     policy = load_policy(args.policy, args.device)
@@ -113,13 +170,7 @@ def main() -> None:
     else:
         n = min(args.episodes, meta.total_episodes)
         episode_ids = sorted(rng.choice(meta.total_episodes, size=n, replace=False).tolist())
-    dataset = LeRobotDataset(
-        args.dataset,
-        root=args.dataset_root,
-        episodes=episode_ids,
-        delta_timestamps=resolve_delta_timestamps(policy.config, meta),
-    )
-    rows = episode_rows(dataset)
+    dataset, rows = load_dataset(args, meta, episode_ids, resolve_delta_timestamps(policy.config, meta))
     action_std = np.asarray(meta.stats["action"]["std"], dtype=np.float64)
     noise_shape = (1, horizon, int(policy.config.max_action_dim))
 

@@ -60,7 +60,7 @@ uv run python scripts/collect_h1.py --episodes 100 --out runs/h1_exact.npz
 uv run python scripts/analyze_h1.py runs/h1_exact.npz
 ```
 
-Сбор сохраняет файл каждые 10 эпизодов (`--save-every`). Результат анализа — в `runs/h1_exact/`: `summary.md`, `summary.json`, `h1_report.png`.
+Если метаданные датасета не совпадают с файлами данных (так у `HuggingFaceVLA/libero`), сбор сам переходит на загрузку всего датасета, около 35 ГБ; `--full-dataset` делает это сразу. Сбор сохраняет файл каждые 10 эпизодов (`--save-every`). Результат анализа — в `runs/h1_exact/`: `summary.md`, `summary.json`, `h1_report.png`.
 
 Проверки устойчивости:
 
