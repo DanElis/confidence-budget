@@ -26,26 +26,22 @@
 
 ## Установка
 
-Нужна GPU (π0.5 в bf16; рекомендуется от 16 ГБ).
+Нужны Linux, NVIDIA GPU (π0.5 в bf16; рекомендуется от 16 ГБ) с драйвером не ниже 570 (LeRobot ставит torch с CUDA 12.8), ffmpeg и [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone https://github.com/huggingface/lerobot.git
-cd lerobot
-git checkout 146d8474932c8b566717eb2738ba459337ab71c4
-pip install -e ".[pi,dataset]"
-cd ..
+sudo apt install ffmpeg
 git clone https://github.com/DanElis/confidence-budget.git
-pip install -r confidence-budget/experiments/h1/requirements.txt
-hf auth login
+cd confidence-budget/experiments/h1
+uv sync
+uv run hf auth login
 ```
 
-Токенизатор `google/paligemma-3b-pt-224` закрыт: до запуска примите лицензию на его странице на Hugging Face.
+`uv sync` ставит Python 3.12 и LeRobot на проверенном коммите (`pyproject.toml`). Токенизатор `google/paligemma-3b-pt-224` закрыт: до запуска примите лицензию на его странице на Hugging Face.
 
-Проверка без загрузки модели (маленькая случайная π0.5 на CPU, около 15 с):
+Проверка без загрузки модели (маленькая случайная π0.5 на CPU, около 30 с):
 
 ```bash
-cd confidence-budget/experiments/h1
-python -m pytest tests -q
+uv run pytest -q
 ```
 
 ## Запуск
@@ -53,15 +49,15 @@ python -m pytest tests -q
 Пробный прогон:
 
 ```bash
-python scripts/collect_h1.py --episodes 2 --max-chunks 2 --out runs/smoke.npz
-python scripts/analyze_h1.py runs/smoke.npz --n-boot 100
+uv run python scripts/collect_h1.py --episodes 2 --max-chunks 2 --out runs/smoke.npz
+uv run python scripts/analyze_h1.py runs/smoke.npz --n-boot 100
 ```
 
 Основной прогон:
 
 ```bash
-python scripts/collect_h1.py --episodes 100 --out runs/h1_exact.npz
-python scripts/analyze_h1.py runs/h1_exact.npz
+uv run python scripts/collect_h1.py --episodes 100 --out runs/h1_exact.npz
+uv run python scripts/analyze_h1.py runs/h1_exact.npz
 ```
 
 Сбор сохраняет файл каждые 10 эпизодов (`--save-every`). Результат анализа — в `runs/h1_exact/`: `summary.md`, `summary.json`, `h1_report.png`.
