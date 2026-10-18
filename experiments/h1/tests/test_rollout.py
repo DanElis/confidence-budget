@@ -83,3 +83,49 @@ def test_config_rejects_impossible_schedules():
         RolloutConfig(H, 30, 25, 25)  # d > s
     with pytest.raises(ValueError):
         RolloutConfig(H, 5, 25, 30)  # mask past the leftover
+
+
+def test_stale_previous_chunk_is_planned_from_older_observation():
+    calls, observed = [], []
+    get_observation, generate = _fake(calls)
+
+    def get_obs_logged(frame):
+        observed.append(frame)
+        return get_observation(frame)
+
+    cfg = RolloutConfig(H, D, S, H - S, prev_source="stale", stale_frames=10)
+    frames = chunk_frames(130, S, 40)  # 40, 65, 90, 115
+    records = run_episode(0, frames, get_obs_logged, generate, (1, H, 32), cfg)
+    assert len(records) == 2 * (len(frames) - 1)
+    # for frame t the stale plan comes from frame t - s - 10
+    for frame in frames[1:]:
+        assert frame - S - 10 in observed
+    rtc_calls = [c for c in calls if c[2] is not None]
+    for (frame, _noise, leftover) in rtc_calls:
+        source = frame - S - 10
+        expected = source + torch.arange(S, H)[:, None] * 1e-3  # free chunk of the source frame, shifted by s
+        assert torch.allclose(leftover, expected.expand(H - S, A))
+
+
+def test_shift_offsets_leftover_but_not_gripper():
+    calls = []
+    get_observation, generate = _fake(calls)
+    base = RolloutConfig(H, D, S, H - S)
+    shifted = RolloutConfig(H, D, S, H - S, prev_shift=0.5)
+    run_episode(0, chunk_frames(80, S, 0), get_observation, generate, (1, H, 32), base)
+    plain = [c[2] for c in calls if c[2] is not None]
+    calls.clear()
+    records = run_episode(0, chunk_frames(80, S, 0), get_observation, generate, (1, H, 32), shifted)
+    moved = [c[2] for c in calls if c[2] is not None]
+    for a, b in zip(plain[:1], moved[:1]):  # first leftover comes from the same free chunk in both runs
+        delta = (b - a)[0]
+        assert torch.allclose(delta[:-1].abs(), torch.full((A - 1,), 0.5))
+        assert delta[-1] == 0
+        assert torch.allclose(b - a, delta.expand_as(b))  # constant over time
+    rtc = [r for r in records if r.condition == "rtc"][0]
+    assert np.allclose(rtc.prev[: H - S], moved[0].numpy())
+
+
+def test_stale_frames_need_stale_source():
+    with pytest.raises(ValueError):
+        RolloutConfig(H, D, S, H - S, stale_frames=10)

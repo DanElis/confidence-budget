@@ -118,3 +118,9 @@ def test_collect_save_and_analyze_end_to_end(tiny_model, tiny_inputs, tiny_polic
     assert summary["frozen_rmse_median"]["rtc"] < summary["frozen_rmse_median"]["free"]
     assert (tmp_path / "h1" / "summary.md").read_text().startswith("# H1")
     assert (tmp_path / "h1" / "h1_report.png").stat().st_size > 10_000
+
+    table = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "sweep_table.py"), str(tmp_path / "h1")],
+        capture_output=True, text=True, check=True,
+    )
+    assert "| h1 |" in table.stdout

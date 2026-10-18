@@ -57,7 +57,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--guidance", choices=GUIDANCE_MODES, default="exact", help="exact VJP (paper) or LeRobot's")
     p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"])
     p.add_argument("--max-guidance-weight", type=float, default=10.0, help="beta, guidance weight clip")
-    p.add_argument("--prev-source", choices=["rtc", "free"], default="rtc", help="chain previous chunks from")
+    p.add_argument("--prev-source", choices=["rtc", "free", "stale"], default="rtc",
+                   help="previous chunk: last RTC chunk, last free chunk, or a stale plan (see --stale-frames)")
+    p.add_argument("--stale-frames", type=int, default=0,
+                   help="with --prev-source stale: the previous chunk is planned from an observation this many "
+                        "frames older than it should be")
+    p.add_argument("--prev-shift", type=float, default=0.0,
+                   help="offset added to the leftover, in std of the normalised actions (random sign per dimension)")
+    p.add_argument("--shift-gripper", action="store_true", help="also shift the last action dimension (gripper)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", type=Path, required=True, help="output .npz")
@@ -153,7 +160,9 @@ def main() -> None:
     policy = load_policy(args.policy, args.device)
     horizon = int(policy.config.chunk_size)
     mask_end = args.mask_end if args.mask_end is not None else horizon - args.stride
-    cfg = RolloutConfig(horizon, args.delay, args.stride, mask_end, args.prev_source, args.seed)
+    cfg = RolloutConfig(horizon, args.delay, args.stride, mask_end, args.prev_source, args.seed,
+                        stale_frames=args.stale_frames, prev_shift=args.prev_shift,
+                        shift_last_dim=args.shift_gripper)
     install_rtc(policy, args.guidance, make_rtc_config(args.schedule, args.max_guidance_weight, mask_end))
     recorder = CrossAttentionRecorder(policy.model).attach()
 
