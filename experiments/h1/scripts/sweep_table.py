@@ -27,6 +27,11 @@ COLUMNS = [
 ]
 
 
+def npz_path(run_dir: Path) -> Path:
+    """runs/<name> -> runs/<name>.npz; names may contain dots (h1_shift0.25_exact)."""
+    return run_dir.with_name(run_dir.name + ".npz")
+
+
 def row(run_dir: Path) -> dict[str, str]:
     summary = json.loads((run_dir / "summary.json").read_text())
     c = summary["correlations"]
@@ -37,7 +42,7 @@ def row(run_dir: Path) -> dict[str, str]:
         return f"{values[0]:.3f}/{values[1]:.3f}"
 
     frozen = summary["frozen_rmse_median"]
-    with np.load(run_dir.with_suffix(".npz")) as data:
+    with np.load(npz_path(run_dir)) as data:
         entropy = data["entropy"][:, -1, :]
         is_rtc = data["is_rtc"]
     free_e, rtc_e = entropy[~is_rtc], entropy[is_rtc]
@@ -65,8 +70,8 @@ def main() -> None:
 
     rows = []
     for run in args.runs:
-        run = run.with_suffix("") if run.suffix == ".npz" else run
-        if (run / "summary.json").exists() and run.with_suffix(".npz").exists():
+        run = run.with_name(run.name[: -len(".npz")]) if run.name.endswith(".npz") else run
+        if (run / "summary.json").exists() and npz_path(run).exists():
             rows.append(row(run))
         else:
             print(f"skip {run}: no summary.json or .npz")
