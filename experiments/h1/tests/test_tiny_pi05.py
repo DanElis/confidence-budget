@@ -124,3 +124,28 @@ def test_collect_save_and_analyze_end_to_end(tiny_model, tiny_inputs, tiny_polic
         capture_output=True, text=True, check=True,
     )
     assert "| h1_shift0.5 |" in table.stdout
+
+
+def test_batch_rtc_per_sample_masks_through_pi05(tiny_model, tiny_inputs, tiny_policy):
+    """Per-sample mask ends reach the guidance through PI05.sample_actions (closed-loop budget path)."""
+    from h1.guidance import install_batch_rtc
+
+    install_batch_rtc(tiny_policy, "lerobot", make_rtc_config("exp", 10.0, H - S))
+    images, img_masks, tokens, masks = tiny_inputs
+    batch2 = ([torch.cat([im, im]) for im in images], [torch.cat([m, m]) for m in img_masks],
+              torch.cat([tokens, tokens]), torch.cat([masks, masks]))
+    g = torch.Generator().manual_seed(7)
+    noise = torch.randn(1, H, tiny_model.config.max_action_dim, generator=g).expand(2, -1, -1).clone()
+    leftover = torch.zeros(2, H, ACTION_DIM)
+    leftover[:, :30] = torch.randn(30, ACTION_DIM, generator=g)
+    with torch.no_grad():
+        free = tiny_model.sample_actions(*batch2, noise=noise.clone())[:, :, :ACTION_DIM]
+        out = tiny_model.sample_actions(*batch2, noise=noise.clone(), inference_delay=4,
+                                        prev_chunk_left_over=leftover, execution_horizon=torch.tensor([6, 25]))
+    out = out[:, :, :ACTION_DIM]
+    for b in range(2):  # frozen prefix pulled toward the leftover in both samples
+        assert (out[b, :4] - leftover[b, :4]).norm() < 0.5 * (free[b, :4] - leftover[b, :4]).norm()
+    # sample 0 has a short mask: index 10 is free there but guided in sample 1
+    d0 = (out[0, 10] - free[0, 10]).norm()
+    d1 = (out[1, 10] - free[1, 10]).norm()
+    assert d1 > d0

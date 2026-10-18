@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 """Closed-loop evaluation of PI0.5 on LIBERO / LIBERO-PRO with simulated inference delay.
 
-Modes (see closed_loop.py):
+Execution modes (see closed_loop.py):
     --delay 0 --guidance none          synchronous chunking (robot waits for every chunk)
     --delay d --guidance none          naive asynchronous switching
     --delay d --guidance lerobot|exact RTC
 
-Suites: stock LIBERO names (``libero_object``) and LIBERO-PRO position levels
-(``pos:x0.2``, ``pos:y0.5``, ``pos:all``). Results go to ``--out`` as one JSON
-per suite (re-running skips finished suites) plus ``summary.md``.
+Planners (see planner.py):
+    --planner fixed --stride s                     constant replanning step (ordinary RTC)
+    --planner budget --hstar-config F --lam 0.5    confidence budget with fixed lambda
+    --planner budget --hstar-config F --lam entropy --lam-config F   lambda from entropy
 
-Example:
-    python scripts/eval_libero.py --suites libero_object,pos:x0.2 --episodes-per-task 20 \\
-        --libero-pro-root third_party/LIBERO-PRO --out runs/sync_s10
+Suites: stock LIBERO names (``libero_object``) and LIBERO-PRO position levels
+(``pos:x0.2``, ``pos:y0.1``, ``pos:all``). Results go to ``--out`` as one JSON
+per suite (re-running skips finished suites) plus ``summary.md``.
 """
 
 from __future__ import annotations
@@ -35,7 +36,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "h1"))
 
-from closed_loop import Chunk, LoopConfig, run_batch, stack_observations, switch_jumps  # noqa: E402
+from closed_loop import Chunk, LoopConfig, run_batch, sparc, stack_observations, switch_jumps  # noqa: E402
+from hstar import HStarRule  # noqa: E402
 from libero_pro_suites import (  # noqa: E402
     MAX_STEPS,
     POSITION_LEVELS,
@@ -43,11 +45,13 @@ from libero_pro_suites import (  # noqa: E402
     register_position_suites,
     suite_name,
 )
+from planner import BudgetPlanner, EntropyLambda, FixedPlanner  # noqa: E402
 
 log = logging.getLogger("eval_libero")
+CONTROL_HZ = 20.0  # LIBERO / robosuite control frequency
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--policy", default="lerobot/pi05_libero_finetuned")
     p.add_argument("--suites", default="libero_object,pos:all",
@@ -57,18 +61,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--episodes-per-task", type=int, default=50, help="init states per task (LIBERO has 50)")
     p.add_argument("--batch-size", type=int, default=10, help="environments run in parallel")
     p.add_argument("--max-steps", type=int, default=None, help=f"default: {MAX_STEPS} for libero_object-based suites")
-    p.add_argument("--stride", type=int, default=None, help="s; default: the checkpoint's n_action_steps")
     p.add_argument("--delay", type=int, default=0, help="d, simulated latency in control steps")
     p.add_argument("--guidance", choices=["none", "lerobot", "exact"], default="none")
-    p.add_argument("--mask-end", type=int, default=None, help="RTC soft-mask end; default H - s")
     p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"])
     p.add_argument("--max-guidance-weight", type=float, default=10.0)
+    # planner
+    p.add_argument("--planner", choices=["fixed", "budget"], default="fixed")
+    p.add_argument("--stride", type=int, default=None, help="fixed: s; default: the checkpoint's n_action_steps")
+    p.add_argument("--mask-end", type=int, default=None, help="fixed: RTC soft-mask end; default H - s")
+    p.add_argument("--hstar-config", type=Path, default=None, help="budget: JSON with the h* rule (calibrate_hstar.py)")
+    p.add_argument("--hstar-rule", default=None,
+                   help='budget: inline rule, e.g. "kind=relative,q=0.7,k=5" (overrides --hstar-config)')
+    p.add_argument("--lam", default="0.5", help="budget: lambda in [0, 1], or 'entropy'")
+    p.add_argument("--lam-config", type=Path, default=None, help="budget, --lam entropy: JSON with mu, sigma, zone, z_max")
+    p.add_argument("--r-min", type=int, default=5)
+    # outputs
     p.add_argument("--record-entropy", action="store_true", help="store cross-attention entropy of every chunk")
-    p.add_argument("--save-actions", action="store_true", help="store executed actions (smoothness analysis)")
+    p.add_argument("--save-actions", action="store_true", help="store executed actions (.npy)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", type=Path, required=True)
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def resolve_suites(spec: str, pro_root: Path) -> list[str]:
@@ -83,9 +96,38 @@ def resolve_suites(spec: str, pro_root: Path) -> list[str]:
     if levels:
         if not pro_root.exists():
             raise SystemExit(f"LIBERO-PRO not found at {pro_root}; see README (git clone ... third_party/LIBERO-PRO)")
-        register_position_suites(pro_root, levels=tuple(dict.fromkeys(levels)))
-        names += [suite_name(level) for level in dict.fromkeys(levels)]
+        levels = list(dict.fromkeys(levels))
+        register_position_suites(pro_root, levels=tuple(levels))
+        names += [suite_name(level) for level in levels]
     return names
+
+
+def parse_rule(text: str) -> HStarRule:
+    fields = {}
+    for part in text.split(","):
+        key, value = part.split("=")
+        key = key.strip()
+        fields[key] = value.strip() if key == "kind" else (int(value) if key in ("k", "min_h", "c") else float(value))
+    return HStarRule.from_dict(fields)
+
+
+def make_planner(args, horizon: int):
+    if args.planner == "fixed":
+        return FixedPlanner(horizon, args.stride, args.mask_end)
+    if args.hstar_rule:
+        rule = parse_rule(args.hstar_rule)
+    elif args.hstar_config:
+        rule = HStarRule.from_dict(json.loads(args.hstar_config.read_text())["rule"])
+    else:
+        raise SystemExit("--planner budget needs --hstar-config or --hstar-rule")
+    if args.lam == "entropy":
+        if args.lam_config is None:
+            raise SystemExit("--lam entropy needs --lam-config")
+        cfg = json.loads(args.lam_config.read_text())
+        cfg = cfg.get("lambda_entropy", cfg)
+        lam_fn = EntropyLambda(**{k: cfg[k] for k in ("mu", "sigma", "zone", "z_max") if k in cfg})
+        return BudgetPlanner(horizon, rule, r_min=args.r_min, lam=None, lam_fn=lam_fn)
+    return BudgetPlanner(horizon, rule, r_min=args.r_min, lam=float(args.lam))
 
 
 def load_policy(path: str, device: str):
@@ -98,12 +140,18 @@ def load_policy(path: str, device: str):
     return policy.to(device).eval()
 
 
+def episode_sparc(actions: np.ndarray) -> float:
+    """SPARC of the commanded end-effector speed (norm of the translational action part)."""
+    a = actions[np.isfinite(actions).all(axis=-1)]
+    return sparc(np.linalg.norm(a[:, :3], axis=-1), CONTROL_HZ) if len(a) else float("nan")
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
     import_libero_quietly()
     from h1.attention import CrossAttentionRecorder
-    from h1.guidance import install_rtc, make_rtc_config
+    from h1.guidance import install_batch_rtc, make_rtc_config
     from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
     from lerobot.envs.libero import LiberoEnv
     from lerobot.envs.utils import parse_camera_names, preprocess_observation
@@ -114,12 +162,16 @@ def main() -> None:
     suites = resolve_suites(args.suites, args.libero_pro_root)
     policy = load_policy(args.policy, args.device)
     horizon = int(policy.config.chunk_size)
-    stride = args.stride or int(policy.config.n_action_steps)
+    if args.planner == "fixed" and args.stride is None:
+        args.stride = int(policy.config.n_action_steps)
+    planner = make_planner(args, horizon)
     max_steps = args.max_steps or MAX_STEPS
-    cfg = LoopConfig(horizon, stride, args.delay, args.guidance != "none", max_steps, args.mask_end, args.seed)
+    cfg = LoopConfig(horizon, args.delay, args.guidance != "none", max_steps, args.seed)
     if args.guidance != "none":
-        install_rtc(policy, args.guidance, make_rtc_config(args.schedule, args.max_guidance_weight, cfg.mask_end))
-    recorder = CrossAttentionRecorder(policy.model).attach() if args.record_entropy else None
+        default_end = horizon - (args.stride or 10)
+        install_batch_rtc(policy, args.guidance, make_rtc_config(args.schedule, args.max_guidance_weight, default_end))
+    need_entropy = args.record_entropy or planner.needs_entropy
+    recorder = CrossAttentionRecorder(policy.model).attach() if need_entropy else None
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy.config, pretrained_path=args.policy,
@@ -129,8 +181,7 @@ def main() -> None:
     env_pre, env_post = env_cfg.get_env_processors()
     camera_names = parse_camera_names(env_cfg.camera_name)
     noise_shape = (horizon, int(policy.config.max_action_dim))
-    log.info("H=%d s=%d d=%d guidance=%s mask_end=%d max_steps=%d", horizon, stride, args.delay,
-             args.guidance, cfg.mask_end, max_steps)
+    log.info("H=%d d=%d guidance=%s planner=%s max_steps=%d", horizon, args.delay, args.guidance, planner, max_steps)
 
     def make_infer(task_description: str):
         def infer(observations, noise, leftover, delay, mask_end) -> Chunk:
@@ -145,13 +196,16 @@ def main() -> None:
             with torch.no_grad(), ctx:
                 pred = policy.predict_action_chunk(batch, noise=noise.to(args.device), **kwargs)
             actions = env_post({ACTION: postprocessor(pred.clone())})[ACTION]
-            entropy = recorder.result().entropy[:, -1].numpy() if recorder else None
-            return Chunk(pred.float(), torch.as_tensor(actions).float().cpu().numpy(), entropy)
+            entropy = n_valid = None
+            if recorder:
+                rec = recorder.result()
+                entropy, n_valid = rec.entropy[:, -1].numpy(), rec.n_valid.numpy()
+            return Chunk(pred.float(), torch.as_tensor(actions).float().cpu().numpy(), entropy, n_valid)
         return infer
 
     args.out.mkdir(parents=True, exist_ok=True)
-    meta = {k: str(v) for k, v in vars(args).items()} | {"horizon": horizon, "stride": stride, "mask_end": cfg.mask_end,
-                                                          "max_steps": max_steps}
+    meta = {k: str(v) for k, v in vars(args).items()} | {"horizon": horizon, "max_steps": max_steps,
+                                                          "planner_repr": repr(planner)}
     (args.out / "config.json").write_text(json.dumps(meta, indent=2))
 
     for name in suites:
@@ -161,7 +215,7 @@ def main() -> None:
             continue
         suite = benchmark.get_benchmark_dict()[name]()
         task_ids = args.task_ids if args.task_ids is not None else list(range(suite.n_tasks))
-        episodes, batches, entropies, actions_all = [], [], [], []
+        episodes, batches, chunk_log, actions_all = [], [], [], []
         started = time.time()
         for tid in task_ids:
             task = suite.get_task(tid)
@@ -174,52 +228,71 @@ def main() -> None:
                 policy.reset()
                 global_ids = [tid * 1000 + i for i in ids]  # noise depends on task and init state only
                 try:
-                    res = run_batch(envs, infer, cfg, global_ids, noise_shape)
+                    res = run_batch(envs, infer, cfg, planner, global_ids, noise_shape, keep_entropy=args.record_entropy)
                 finally:
                     for env in envs:
                         env.close()
                 jump_switch, jump_other = switch_jumps(res.actions, res.switch_steps)
                 for b, i in enumerate(ids):
-                    episodes.append({"task_id": tid, "init_state": i, "success": bool(res.success[b]),
-                                     "length": int(res.length[b])})
-                batches.append({"task_id": tid, "init_states": ids, "n_inference": res.n_inference,
-                                "jump_at_switch": jump_switch, "jump_other": jump_other})
-                if args.record_entropy and res.chunk_entropy:
-                    entropies.append({"task_id": tid, "init_states": ids, "steps": res.chunk_steps,
-                                      "entropy": np.stack(res.chunk_entropy).tolist()})
+                    strides = [c["stride"] for c in res.chunks if c["env"] == b]
+                    hs = [c["h_star"] for c in res.chunks if c["env"] == b and c["h_star"] is not None]
+                    episodes.append({
+                        "task_id": tid, "init_state": i, "success": bool(res.success[b]),
+                        "length": int(res.length[b]), "n_inference": int(res.n_inference[b]),
+                        "sparc": episode_sparc(res.actions[b]),
+                        "mean_stride": float(np.mean(strides)) if strides else None,
+                        "mean_h_star": float(np.mean(hs)) if hs else None,
+                    })
+                batches.append({"task_id": tid, "init_states": ids, "jump_at_switch": jump_switch,
+                                "jump_other": jump_other})
+                for c in res.chunks:
+                    chunk_log.append({"task_id": tid, "init_state": ids[c["env"]]} | {k: v for k, v in c.items() if k != "env"})
                 if args.save_actions:
                     actions_all.append(res.actions)
                 done = [e for e in episodes if e["task_id"] == tid]
                 log.info("%s task %d: %d/%d success after %d episodes (%.0f s)", name, tid,
                          sum(e["success"] for e in done), len(done), len(done), time.time() - started)
-        sr = float(np.mean([e["success"] for e in episodes]))
-        by_task = {tid: float(np.mean([e["success"] for e in episodes if e["task_id"] == tid])) for tid in task_ids}
-        result = {"suite": name, "success_rate": sr, "by_task": by_task, "n_episodes": len(episodes),
-                  "mean_inference": float(np.mean([b["n_inference"] for b in batches])),
-                  "jump_at_switch": float(np.nanmean([b["jump_at_switch"] for b in batches])),
-                  "jump_other": float(np.nanmean([b["jump_other"] for b in batches])),
-                  "episodes": episodes, "batches": batches, "seconds": time.time() - started}
+        result = summarize(name, episodes, batches, task_ids)
+        result["seconds"] = time.time() - started
         out_file.write_text(json.dumps(result, indent=1))
-        if entropies:
-            (args.out / f"{name}_entropy.json").write_text(json.dumps(entropies))
+        (args.out / f"{name}_chunks.json").write_text(json.dumps(chunk_log))
         if actions_all:
             np.save(args.out / f"{name}_actions.npy", np.concatenate(actions_all))
-        log.info("%s: success %.1f%% over %d episodes", name, 100 * sr, len(episodes))
+        log.info("%s: success %.1f%% over %d episodes", name, 100 * result["success_rate"], len(episodes))
 
     write_summary(args.out, suites)
     if recorder:
         recorder.detach()
 
 
+def summarize(name: str, episodes: list[dict], batches: list[dict], task_ids) -> dict:
+    mean = lambda xs: float(np.nanmean(xs)) if len(xs) and np.isfinite(xs).any() else float("nan")  # noqa: E731
+    return {
+        "suite": name,
+        "success_rate": mean([e["success"] for e in episodes]),
+        "by_task": {tid: mean([e["success"] for e in episodes if e["task_id"] == tid]) for tid in task_ids},
+        "n_episodes": len(episodes),
+        "mean_inference": mean([e["n_inference"] for e in episodes]),
+        "mean_sparc": mean([e["sparc"] for e in episodes]),
+        "jump_at_switch": mean([b["jump_at_switch"] for b in batches]),
+        "jump_other": mean([b["jump_other"] for b in batches]),
+        "mean_stride": mean([e["mean_stride"] for e in episodes if e["mean_stride"] is not None]),
+        "mean_h_star": mean([e["mean_h_star"] for e in episodes if e["mean_h_star"] is not None]),
+        "episodes": episodes,
+        "batches": batches,
+    }
+
+
 def write_summary(out: Path, suites: list[str]) -> None:
-    rows = ["| suite | success, % | episodes | inferences / batch | |Δa| at switch | |Δa| other |",
-            "|---|---|---|---|---|---|"]
+    rows = ["| suite | success, % | episodes | inferences / ep. | SPARC | |Δa| switch / other | mean s | mean h* |",
+            "|---|---|---|---|---|---|---|---|"]
     for name in suites:
         f = out / f"{name}.json"
         if f.exists():
             r = json.loads(f.read_text())
             rows.append(f"| {name} | {100 * r['success_rate']:.1f} | {r['n_episodes']} | {r['mean_inference']:.1f} "
-                        f"| {r['jump_at_switch']:.4f} | {r['jump_other']:.4f} |")
+                        f"| {r.get('mean_sparc', float('nan')):.3f} | {r['jump_at_switch']:.4f} / {r['jump_other']:.4f} "
+                        f"| {r.get('mean_stride', float('nan')):.1f} | {r.get('mean_h_star', float('nan')):.1f} |")
     (out / "summary.md").write_text("\n".join(rows) + "\n")
     print("\n".join(rows))
 

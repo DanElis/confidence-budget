@@ -62,6 +62,26 @@ uv run python scripts/eval_libero.py --suites pos:x0.2 --stride 10 --delay 4 --g
 
 `--record-entropy` сохраняет энтропию cross-attention каждого чанка (для калибровки $h^*$), `--save-actions` — исполненные действия.
 
+## Этапы экспериментов
+
+Параметры подбираются на уровнях сдвига по y (y0.1–y0.3), итоговые числа считаются на исходном `libero_object` и x0.1–x0.4 (с ними сопоставимы опубликованные результаты). Скрипты лежат в `scripts/stages/`, запускаются из `experiments/libero_pro`. Каждый запуск пишет `runs/<имя>/`, готовые наборы пропускаются; наборы считаются параллельно (`JOBS`, по умолчанию 4 процесса, около 10 ГБ видеопамяти на процесс). Значения, выбранные на одном этапе, передаются в следующий переменными окружения.
+
+| Этап | Команда | Что выбрать по итогам |
+|---|---|---|
+| 1. Асинхронная база, $d = 4$ | `bash scripts/stages/stage1_async_baselines.sh` | `S_BEST` — лучший шаг RTC в `runs/stage1_d4.md` |
+| 1b. Другие задержки | `S_BEST=… bash scripts/stages/stage1_async_baselines.sh` | — |
+| 2. Калибровка $h^*$ | `S_BEST=… bash scripts/stages/stage2_calibrate_hstar.sh` | правило в `runs/hstar.json`; оно должно обгонять константу |
+| 3. Сетка по $\lambda$ | `S_BEST=… bash scripts/stages/stage3_lambda_grid.sh` | `LAM_BEST` по `runs/stage3_d4.md` |
+| 4. $\lambda$ по энтропии | `S_BEST=… LAM_BEST=… bash scripts/stages/stage4_lambda_entropy.sh` | `ZMAX_BEST` по `runs/stage4_d4.md` |
+| 5. Финальная оценка | `S_BEST=… S_SYNC=… LAM_BEST=… ZMAX_BEST=… bash scripts/stages/stage5_final.sh` | таблицы `runs/final_d{2,4,8}.md` |
+| 6. Абляции | `S_BEST=… LAM_BEST=… ZMAX_BEST=… bash scripts/stages/stage6_ablations.sh` | `runs/ablations_d4.md` |
+
+`S_SYNC` — лучший синхронный шаг (5 или 10) из базового прогона. Если сервер PyTorch недоступен, перед запуском задайте `PY=.venv/bin/python`.
+
+Таблицы строит `scripts/compare.py`: успех по наборам, разность с эталоном (RTC с $s^*$), парная по начальным состояниям, с 95% бутстрэп-интервалом, число вызовов модели, SPARC по командам скорости, скачок действия на стыках, средний шаг $s$.
+
+Бюджет уверенности (`--planner budget`): после каждого чанка $h^*$ считается по энтропии (`hstar.py`), затем $s = d + \lambda\rho$, $r = r_{\min} + (1-\lambda)\rho$, $\rho = h^* - 2d - r_{\min}$ (`planner.py`); следующий чанк генерируется с RTC и мягкой маской длины $r$. У каждой среды своё расписание; среды, которым чанк нужен на одном шаге, считаются одним вызовом модели.
+
 ## Результаты
 
 В `--out`: по файлу `<набор>.json` на набор (успех по эпизодам и задачам, число инференсов, скачок действия при переключении чанка) и `summary.md`. Готовые наборы при перезапуске пропускаются.

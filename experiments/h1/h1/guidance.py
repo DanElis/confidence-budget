@@ -108,3 +108,80 @@ def install_rtc(policy, mode: str, rtc_config: RTCConfig) -> RTCProcessor:
     policy.rtc_processor = processor
     policy.model.rtc_processor = processor
     return processor
+
+
+class BatchRTCProcessor(RTCProcessor):
+    """RTC guidance with a per-sample delay and soft-mask end.
+
+    ``inference_delay`` and ``execution_horizon`` may be ints or (B,) tensors, so
+    environments of one batch can follow different schedules (the confidence
+    budget picks the mask per chunk). ``prev_chunk_left_over`` is (B, T, A) and
+    may be zero-padded past each sample's mask end.
+
+    jacobian=False reproduces LeRobot's ``RTCProcessor`` (correction = weighted
+    error, all action dimensions weighted); jacobian=True reproduces
+    ``ExactRTCProcessor`` (VJP through the denoiser, padded dimensions masked).
+    """
+
+    def __init__(self, rtc_config, jacobian: bool):
+        super().__init__(rtc_config)
+        self.jacobian = jacobian
+
+    def prefix_weights(self, delay, mask_end, batch: int, horizon: int, prev_len: int) -> torch.Tensor:
+        delays = torch.as_tensor(delay).reshape(-1).expand(batch) if torch.as_tensor(delay).numel() == 1 \
+            else torch.as_tensor(delay).reshape(-1)
+        ends = torch.as_tensor(mask_end).reshape(-1).expand(batch) if torch.as_tensor(mask_end).numel() == 1 \
+            else torch.as_tensor(mask_end).reshape(-1)
+        rows = [
+            self.get_prefix_weights(int(d), min(int(e), prev_len), horizon)
+            for d, e in zip(delays.tolist(), ends.tolist(), strict=True)
+        ]
+        return torch.stack(rows)  # (B, H)
+
+    def denoise_step(self, x_t, prev_chunk_left_over, inference_delay, time,
+                     original_denoise_step_partial, execution_horizon=None):
+        if prev_chunk_left_over is None:
+            return original_denoise_step_partial(x_t)
+        squeezed = x_t.ndim < 3
+        if squeezed:
+            x_t = x_t.unsqueeze(0)
+        prev = prev_chunk_left_over if prev_chunk_left_over.ndim == 3 else prev_chunk_left_over.unsqueeze(0)
+        if execution_horizon is None:
+            execution_horizon = self.rtc_config.execution_horizon
+
+        batch, horizon, action_dim = x_t.shape
+        real_dim = min(prev.shape[2], action_dim)
+        steps = min(prev.shape[1], horizon)
+        target = torch.zeros(batch, horizon, action_dim, device=x_t.device, dtype=x_t.dtype)
+        target[:, :steps, :real_dim] = prev[:, :steps, :real_dim].to(device=x_t.device, dtype=x_t.dtype)
+        w = self.prefix_weights(inference_delay, execution_horizon, batch, horizon, prev.shape[1])
+        weights = w.to(device=x_t.device, dtype=x_t.dtype)[:, :, None].expand(batch, horizon, action_dim).clone()
+        if self.jacobian:
+            weights[:, :, real_dim:] = 0.0
+
+        if self.jacobian:
+            with torch.enable_grad():
+                x = x_t.detach().clone().requires_grad_(True)
+                v_t = original_denoise_step_partial(x)
+                x1 = x - time * v_t
+                err = (target - x1) * weights
+                (correction,) = torch.autograd.grad(x1, x, grad_outputs=err.detach())
+            v_t = v_t.detach()
+        else:
+            v_t = original_denoise_step_partial(x_t.detach())
+            correction = (target - (x_t - time * v_t)) * weights
+
+        weight = guidance_weight(time, self.rtc_config.max_guidance_weight).to(x_t.device)
+        result = v_t - weight.to(v_t.dtype) * correction.to(v_t.dtype)
+        return result.squeeze(0) if squeezed else result
+
+
+def install_batch_rtc(policy, mode: str, rtc_config: RTCConfig) -> BatchRTCProcessor:
+    """Like ``install_rtc`` but with per-sample delay / mask end (closed-loop budget)."""
+    if mode not in GUIDANCE_MODES:
+        raise ValueError(f"unknown guidance mode {mode!r}, choose from {GUIDANCE_MODES}")
+    policy.config.rtc_config = rtc_config
+    processor = BatchRTCProcessor(rtc_config, jacobian=(mode == "exact"))
+    policy.rtc_processor = processor
+    policy.model.rtc_processor = processor
+    return processor

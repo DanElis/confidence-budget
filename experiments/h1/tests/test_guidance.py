@@ -66,3 +66,32 @@ def test_no_previous_chunk_is_plain_denoising(linear):
 def test_guidance_weight_is_clipped():
     assert guidance_weight(1.0, 10.0).item() == pytest.approx(10.0)  # pure noise: clip
     assert guidance_weight(0.5, 100.0).item() == pytest.approx(2.0)  # (1-tau)/(tau r^2) at tau = 0.5
+
+
+def test_batch_processor_matches_scalar_processors(linear):
+    from h1.guidance import BatchRTCProcessor
+
+    _mix, _bias, denoiser = linear
+    x_t, prev = _inputs()
+    cfg = make_rtc_config("exp", 5.0, END)
+    for jac, ref in ((False, RTCProcessor(cfg)), (True, ExactRTCProcessor(cfg))):
+        batch = BatchRTCProcessor(cfg, jacobian=jac)
+        got = batch.denoise_step(x_t, prev, D, 0.6, denoiser, execution_horizon=END)
+        want = ref.denoise_step(x_t, prev, D, 0.6, denoiser, execution_horizon=END)
+        assert torch.allclose(got, want, atol=1e-5), jac
+
+
+def test_batch_processor_per_sample_schedule(linear):
+    from h1.guidance import BatchRTCProcessor
+
+    _mix, _bias, denoiser = linear
+    g = torch.Generator().manual_seed(5)
+    x_t = torch.randn(2, H, A, generator=g)
+    prev = torch.randn(2, H, REAL, generator=g)
+    cfg = make_rtc_config("exp", 5.0, END)
+    for jac in (False, True):
+        proc = BatchRTCProcessor(cfg, jacobian=jac)
+        both = proc.denoise_step(x_t, prev, torch.tensor([1, 3]), 0.6, denoiser, execution_horizon=torch.tensor([4, 7]))
+        first = proc.denoise_step(x_t[:1], prev[:1], 1, 0.6, lambda x: denoiser(x), execution_horizon=4)
+        second = proc.denoise_step(x_t[1:], prev[1:], 3, 0.6, lambda x: denoiser(x), execution_horizon=7)
+        assert torch.allclose(both[0], first[0], atol=1e-5) and torch.allclose(both[1], second[0], atol=1e-5)
