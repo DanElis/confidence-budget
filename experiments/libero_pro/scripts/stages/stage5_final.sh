@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage 5: final evaluation on the report levels (libero_object, x0.1-x0.4), 50 init states per task.
+# Stage 5: final evaluation on the report levels (libero_object, x0.1-x0.3), 50 init states per task.
 #   S_BEST=10 S_SYNC=5 LAM_BEST=0.5 ZMAX_BEST=2 bash scripts/stages/stage5_final.sh
 # About 4-5 h per method and delay with JOBS=1; JOBS=4-5 divides that.
 cd "$(dirname "$0")/../.." && source scripts/stages/lib.sh

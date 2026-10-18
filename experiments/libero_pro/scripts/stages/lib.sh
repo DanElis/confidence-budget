@@ -13,7 +13,7 @@ RUNS=${RUNS:-runs}
 mkdir -p "$RUNS"
 
 Y_LEVELS="pos:y0.1,pos:y0.2,pos:y0.3"            # tuning
-X_LEVELS="libero_object,pos:x0.1,pos:x0.2,pos:x0.3,pos:x0.4"   # final report
+X_LEVELS="libero_object,pos:x0.1,pos:x0.2,pos:x0.3"   # final report
 
 suite_dir_name() {  # pos:x0.2 -> libero_object_pos_x0.2
   case "$1" in pos:*) echo "libero_object_pos_${1#pos:}";; *) echo "$1";; esac
