@@ -146,7 +146,7 @@ def load_dataset(args, meta, episode_ids, delta_timestamps):
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
     from lerobot.datasets import LeRobotDatasetMetadata, resolve_delta_timestamps
     from lerobot.policies import make_pre_post_processors
 
