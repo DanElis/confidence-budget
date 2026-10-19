@@ -13,7 +13,8 @@ EPISODES=${EPISODES:-10}
 RUNS=${RUNS:-runs}
 MIN_FREE_MB=${MIN_FREE_MB:-18000}   # ~14 GB per process + margin
 RESERVE_S=${RESERVE_S:-90}         # model load time before the next launch
-OOM_RETRIES=${OOM_RETRIES:-3}
+OOM_RETRIES=${OOM_RETRIES:-3}       # retries after CUDA OOM or a hang
+SUITE_TIMEOUT=${SUITE_TIMEOUT:-4h}   # one suite normally takes 0.5-1.5 h; longer means the simulator hung
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 mkdir -p "$RUNS"
 
@@ -41,10 +42,17 @@ eval_one() {  # eval_one OUT SUITE ARGS...: one suite, retried on CUDA OOM up to
   local out=$1 s=$2; shift 2
   local log="$out/$(suite_dir_name "$s").log" try
   for (( try = 0; try <= OOM_RETRIES; try++ )); do
-    (( try > 0 )) && { echo "$(date '+%F %T') retry $try $(basename "$out")/$s after CUDA OOM"; sleep $((60 * try)); wait_for_gpu; }
-    if $PY scripts/eval_libero.py --suites "$s" --episodes-per-task "$EPISODES" --out "$out" "$@" > "$log" 2>&1; then
+    (( try > 0 )) && { echo "$(date '+%F %T') retry $try $(basename "$out")/$s"; sleep $((60 * try)); wait_for_gpu; }
+    local rc=0
+    timeout --kill-after=60 "$SUITE_TIMEOUT" $PY scripts/eval_libero.py --suites "$s" --episodes-per-task "$EPISODES" \
+      --out "$out" "$@" > "$log" 2>&1 || rc=$?
+    if (( rc == 0 )); then
       echo "$(date '+%F %T') done  $(basename "$out")/$s: $(grep -o 'success [0-9.]*%' "$log" | tail -1)"
       return 0
+    fi
+    if (( rc == 124 || rc == 137 )); then
+      echo "$(date '+%F %T') timeout $(basename "$out")/$s after $SUITE_TIMEOUT"
+      continue
     fi
     grep -q "OutOfMemoryError\|CUDA out of memory" "$log" || break
   done
