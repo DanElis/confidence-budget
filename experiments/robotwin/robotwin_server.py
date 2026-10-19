@@ -74,20 +74,44 @@ class _NoCuroboPlanner:
                            "end-effector control and expert checks need CuRobo installed")
 
 
+def _stub_getattr(name: str):
+    if name.startswith("__"):  # module dunders (__file__, __path__, ...) must stay missing for inspect & co
+        raise AttributeError(name)
+    return _Anything
+
+
 def install_curobo_stub() -> bool:
+    """Make RoboTwin importable without CuRobo.
+
+    envs/robot/robot.py does ``from .planner import CuroboPlanner``, and planner.py defines that class
+    only if its CuRobo imports succeed. So: register stub ``curobo`` modules, load the package
+    ``envs.robot`` without running its __init__, import ``envs.robot.planner`` alone, set its
+    CuroboPlanner to a stub, and only then run the package __init__ (which imports robot.py).
+    """
     if importlib.util.find_spec("curobo") is not None:
         return False
-    names = ["curobo", "curobo.types", "curobo.types.math", "curobo.types.robot", "curobo.wrap",
-             "curobo.wrap.reacher", "curobo.wrap.reacher.motion_gen", "curobo.util"]
-    for name in names:
+    for name in ["curobo", "curobo.types", "curobo.types.math", "curobo.types.robot", "curobo.wrap",
+                 "curobo.wrap.reacher", "curobo.wrap.reacher.motion_gen", "curobo.util"]:
         mod = types.ModuleType(name)
-        mod.__getattr__ = lambda attr: _Anything  # noqa: E731  (module-level __getattr__, PEP 562)
+        mod.__getattr__ = _stub_getattr
         sys.modules[name] = mod
     sys.modules["curobo.util"].logger = _Anything()
-    import envs.robot.planner as planner_mod
-    import envs.robot.robot as robot_mod
-    planner_mod.CuroboPlanner = _NoCuroboPlanner
-    robot_mod.CuroboPlanner = _NoCuroboPlanner
+
+    import envs
+
+    pkg_dir = os.path.join(os.path.dirname(os.path.abspath(envs.__file__)), "robot")
+    if "envs.robot" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("envs.robot", os.path.join(pkg_dir, "__init__.py"),
+                                                      submodule_search_locations=[pkg_dir])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["envs.robot"] = pkg
+        envs.robot = pkg
+        with contextlib.redirect_stdout(io.StringIO()):  # planner.py prints a long warning when CuRobo is off
+            planner_mod = importlib.import_module("envs.robot.planner")
+        planner_mod.CuroboPlanner = _NoCuroboPlanner
+        spec.loader.exec_module(pkg)
+    sys.modules["envs.robot.planner"].CuroboPlanner = _NoCuroboPlanner
+    sys.modules["envs.robot.robot"].CuroboPlanner = _NoCuroboPlanner
     return True
 
 
