@@ -32,7 +32,7 @@ step "2. Python 3.10 venv and requirements"
 cd "$RT"
 [[ -x .venv/bin/python ]] || uv venv -p 3.10 .venv
 grep -v -E '^(azure|azure-ai-inference|openai|wandb)\b' scripts/requirements.txt > .venv/requirements_eval.txt
-echo "toppra" >> .venv/requirements_eval.txt
+printf "toppra\nsetuptools==69.5.1\n" >> .venv/requirements_eval.txt   # pkg_resources; uv venvs come without setuptools
 uv pip install --python .venv/bin/python -r .venv/requirements_eval.txt
 PYRT=$RT/.venv/bin/python
 
@@ -52,12 +52,25 @@ fi
 $PYRT scripts/update_embodiment_config_path.py > /dev/null
 
 step "5. checks"
-if ! ls /usr/share/vulkan/icd.d/*nvidia* /etc/vulkan/icd.d/*nvidia* >/dev/null 2>&1; then
-  echo "WARNING: no NVIDIA Vulkan ICD found (/usr/share/vulkan/icd.d or /etc/vulkan/icd.d)."
-  echo "         SAPIEN renders with Vulkan; if the render test below fails, the admin needs to install"
-  echo "         the NVIDIA Vulkan driver package (e.g. libnvidia-gl-550) and libvulkan1."
+ICD_USER=$HOME/.local/share/vulkan/icd.d/nvidia_icd.json
+if ! ls /usr/share/vulkan/icd.d/*nvidia* /etc/vulkan/icd.d/*nvidia* "$ICD_USER" >/dev/null 2>&1; then
+  # The driver often ships the Vulkan implementation (libGLX_nvidia.so.0) without registering it;
+  # the Vulkan loader also reads ICDs from ~/.local/share/vulkan/icd.d, so no admin rights are needed.
+  if ldconfig -p | grep -q libGLX_nvidia.so.0; then
+    mkdir -p "$(dirname "$ICD_USER")"
+    printf '{"file_format_version": "1.0.0", "ICD": {"library_path": "libGLX_nvidia.so.0", "api_version": "1.3"}}\n' > "$ICD_USER"
+    echo "registered the NVIDIA Vulkan driver for this user: $ICD_USER"
+  else
+    echo "WARNING: no NVIDIA Vulkan driver found (no ICD file, no libGLX_nvidia.so.0)."
+    echo "         SAPIEN renders with Vulkan; the admin needs to install the NVIDIA GL/Vulkan driver"
+    echo "         package matching the kernel driver (e.g. libnvidia-gl-550) and libvulkan1."
+  fi
 fi
-$PYRT scripts/test_render.py 2>&1 | tail -2
+ldconfig -p | grep -q "libvulkan.so.1" || echo "note: no system libvulkan.so.1 (Vulkan loader); SAPIEN may still bring its own"
+if ! $PYRT scripts/test_render.py 2>&1 | tail -3 | tee /dev/stderr | grep -q "Render Well"; then
+  echo "STOP: SAPIEN cannot render. Diagnostics:"; $PYRT -c "import sapien; sapien.render.RenderSystem()" 2>&1 | tail -5
+  exit 1
+fi
 
 cd "$HERE"
 step "6. policy SidneyXie/pi05_robotwin"
