@@ -32,6 +32,8 @@ ZMAXES="1 2 3"
 H1=${H1_RUNS:-../h1/runs}
 HSTAR=$RUNS/hstar.json
 main() {
+# Ctrl-C or kill of the script also stops every evaluation it started (no orphans holding GPU memory).
+trap 'trap - INT TERM; kill 0' INT TERM
 # 1. calibration ------------------------------------------------------------------
 if [[ ! -f $HSTAR ]]; then
   CONFLICT=$(ls "$H1"/h1_stale*_lerobot.npz "$H1"/h1_shift*_lerobot.npz 2>/dev/null | tr '\n' ' ')

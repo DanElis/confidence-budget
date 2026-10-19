@@ -299,3 +299,8 @@ def write_summary(out: Path, suites: list[str]) -> None:
 
 if __name__ == "__main__":
     main()
+    # Results are on disk. Skip interpreter teardown: EGL / MuJoCo contexts can hang there and keep
+    # the GPU memory of a finished run allocated.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
