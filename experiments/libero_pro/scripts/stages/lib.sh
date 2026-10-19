@@ -8,6 +8,7 @@
 #                                         after "uv sync --no-sources")
 set -u
 PY=${PY:-"uv run python"}
+EVAL_SCRIPT=${EVAL_SCRIPT:-scripts/eval_libero.py}   # experiments/robotwin sets scripts/eval_robotwin.py
 JOBS=${JOBS:-4}
 EPISODES=${EPISODES:-10}
 RUNS=${RUNS:-runs}
@@ -44,7 +45,7 @@ eval_one() {  # eval_one OUT SUITE ARGS...: one suite, retried on CUDA OOM up to
   for (( try = 0; try <= OOM_RETRIES; try++ )); do
     (( try > 0 )) && { echo "$(date '+%F %T') retry $try $(basename "$out")/$s"; sleep $((60 * try)); wait_for_gpu; }
     local rc=0
-    timeout --kill-after=60 "$SUITE_TIMEOUT" $PY scripts/eval_libero.py --suites "$s" --episodes-per-task "$EPISODES" \
+    timeout --kill-after=60 "$SUITE_TIMEOUT" $PY "$EVAL_SCRIPT" --suites "$s" --episodes-per-task "$EPISODES" \
       --out "$out" "$@" > "$log" 2>&1 || rc=$?
     if (( rc == 0 )); then
       echo "$(date '+%F %T') done  $(basename "$out")/$s: $(grep -o 'success [0-9.]*%' "$log" | tail -1)"

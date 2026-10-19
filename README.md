@@ -144,3 +144,4 @@ $$h^* = \min(\mathcal{C}) + k, \quad \text{если } \mathcal{C} \ne \varnothin
 22. Chen T. et al. RoboTwin 2.0: A Scalable Data Generator and Benchmark with Strong Domain Randomization for Robust Bimanual Robotic Manipulation. arXiv:2506.18088, 2025.
 23. Matthews M., Beukman M., Lu C., Foerster J. Kinetix: Investigating the Training of General Agents through Open-Ended Physics-Based Control Tasks. arXiv:2410.23208, 2024.
 24. Balasubramanian S. et al. On the Analysis of Movement Smoothness. Journal of NeuroEngineering and Rehabilitation, 12, 2015.
+- [`experiments/robotwin`](experiments/robotwin): RoboTwin 2.0, π0.5 — синхронный / асинхронный чанкинг, RTC и бюджет.

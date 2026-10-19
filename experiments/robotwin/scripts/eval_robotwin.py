@@ -1,0 +1,275 @@
+#!/usr/bin/env python
+"""Closed-loop evaluation of PI0.5 on RoboTwin 2.0 (Easy, demo_clean) with simulated inference delay.
+
+Same execution modes and planners as experiments/libero_pro/scripts/eval_libero.py:
+    --delay 0 --guidance none          synchronous chunking
+    --delay d --guidance none          naive asynchronous switching
+    --delay d --guidance lerobot|exact RTC;  --planner budget ...  confidence budget
+
+The simulator runs in RoboTwin's own Python (see setup_robotwin.sh), one server process per
+parallel environment (remote_env.py); the policy runs here. Episode i of a task uses seed
+100000 * (1 + --seed) + 1000 * i (unstable scenes are skipped deterministically), so every
+method sees the same scenes and the same flow-matching noise; results can be paired.
+
+Output: one JSON per task in --out (same format as eval_libero, so compare.py works with
+--suites <task,...>), <task>_chunks.json, summary.md. Finished tasks are skipped.
+
+Example:
+    uv run --project ../libero_pro python scripts/eval_robotwin.py --suites lift_pot,stamp_seal \\
+        --episodes-per-task 25 --stride 25 --delay 6 --guidance lerobot --out runs/rtc_s25_d6
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+HERE = Path(__file__).resolve().parents[1]
+LIBERO_PRO = HERE.parent / "libero_pro"
+for p in (HERE, LIBERO_PRO, LIBERO_PRO / "scripts", HERE.parent / "h1"):
+    sys.path.insert(0, str(p))
+
+import eval_libero as EL  # noqa: E402  (planner, policy loading, summaries)
+from closed_loop import Chunk, LoopConfig, run_batch, sparc, stack_observations, switch_jumps  # noqa: E402
+from remote_env import RemoteEnv, SimulatorError  # noqa: E402
+
+log = logging.getLogger("eval_robotwin")
+CONTROL_HZ = 25.0  # RoboTwin control frequency
+ARM_JOINTS = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]  # 14-d action without the two grippers
+CAMERAS = ("head_camera", "left_camera", "right_camera")
+# RoboTwin camera names -> feature names of SidneyXie/pi05_robotwin (its README's --rename_map)
+RENAME = {"observation.images.head_camera": "observation.images.cam_high",
+          "observation.images.left_camera": "observation.images.cam_left_wrist",
+          "observation.images.right_camera": "observation.images.cam_right_wrist"}
+
+# 8 tasks with mid success for the checkpoint (41-60% on Easy; README of SidneyXie/pi05_robotwin),
+# all with a 400-500 step limit: room to get better or worse, and cheap episodes.
+TASKS_DEFAULT = ("lift_pot,move_can_pot,place_a2b_left,place_bread_skillet,place_fan,place_mouse_pad,"
+                 "stamp_seal,turn_switch")
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--policy", default="SidneyXie/pi05_robotwin")
+    p.add_argument("--suites", default=TASKS_DEFAULT, help="comma-separated RoboTwin task names")
+    p.add_argument("--episodes-per-task", type=int, default=25)
+    p.add_argument("--batch-size", type=int, default=8, help="simulator processes run in parallel")
+    p.add_argument("--robotwin-root", type=Path, default=HERE / "third_party" / "RoboTwin")
+    p.add_argument("--robotwin-python", default=None, help="default: <robotwin-root>/.venv/bin/python")
+    p.add_argument("--max-steps", type=int, default=None, help="default: RoboTwin's per-task step limit")
+    p.add_argument("--delay", type=int, default=0)
+    p.add_argument("--guidance", choices=["none", "lerobot", "exact"], default="none")
+    p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"])
+    p.add_argument("--max-guidance-weight", type=float, default=10.0)
+    p.add_argument("--planner", choices=["fixed", "budget"], default="fixed")
+    p.add_argument("--stride", type=int, default=None, help="fixed: s; default: the checkpoint's n_action_steps")
+    p.add_argument("--mask-end", type=int, default=None)
+    p.add_argument("--hstar-config", type=Path, default=None)
+    p.add_argument("--hstar-rule", default=None)
+    p.add_argument("--lam", default="0.5")
+    p.add_argument("--lam-config", type=Path, default=None)
+    p.add_argument("--r-min", type=int, default=5)
+    p.add_argument("--record-entropy", action="store_true")
+    p.add_argument("--save-actions", action="store_true")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--fake-sim", action="store_true", help="synthetic simulator (tests the plumbing)")
+    p.add_argument("--fake-policy", action="store_true",
+                   help="hold the current joint state instead of running the model (tests the simulator)")
+    p.add_argument("--out", type=Path, required=True)
+    return p.parse_args(argv)
+
+
+def episode_sparc(actions: np.ndarray) -> float:
+    """SPARC of the commanded joint speed of both arms (grippers excluded)."""
+    a = actions[np.isfinite(actions).all(axis=-1)]
+    if len(a) < 5:
+        return float("nan")
+    return sparc(np.linalg.norm(np.diff(a[:, ARM_JOINTS], axis=0), axis=-1) * CONTROL_HZ, CONTROL_HZ)
+
+
+def to_policy_batch(observations: list, instruction: str) -> dict:
+    from lerobot.envs.utils import preprocess_observation
+
+    obs = preprocess_observation(stack_observations(observations))
+    obs = {RENAME.get(k, k): v for k, v in obs.items()}
+    obs["task"] = [instruction] * len(observations)
+    return obs
+
+
+class Simulators:
+    """Pool of RemoteEnv servers, restarted when one dies."""
+
+    def __init__(self, n: int, args, log_dir: Path):
+        self.n, self.args, self.log_dir = n, args, log_dir
+        self.python = args.robotwin_python or str(args.robotwin_root / ".venv" / "bin" / "python")
+        if args.fake_sim:
+            self.python = sys.executable
+        self.envs = [self._start(i) for i in range(n)]
+
+    def _start(self, i: int) -> RemoteEnv:
+        return RemoteEnv(self.python, None if self.args.fake_sim else self.args.robotwin_root.resolve(),
+                         log_path=self.log_dir / f"sim{i}.log", fake=self.args.fake_sim, cameras=CAMERAS)
+
+    def heal(self) -> None:
+        for i, env in enumerate(self.envs):
+            if not env.alive:
+                log.warning("restarting simulator %d", i)
+                env.close()
+                self.envs[i] = self._start(i)
+
+    def close(self) -> None:
+        for env in self.envs:
+            env.close()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
+    tasks = [t.strip() for t in args.suites.split(",") if t.strip()]
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "sim_logs").mkdir(exist_ok=True)
+
+    if args.fake_policy:
+        policy, horizon, n_action_steps, noise_shape = None, 50, 50, (50, 32)
+    else:
+        from h1.guidance import install_batch_rtc, make_rtc_config
+        from lerobot.policies import make_pre_post_processors
+
+        policy = EL.load_policy(args.policy, args.device)
+        horizon, n_action_steps = int(policy.config.chunk_size), int(policy.config.n_action_steps)
+        noise_shape = (horizon, int(policy.config.max_action_dim))
+    if args.planner == "fixed" and args.stride is None:
+        args.stride = n_action_steps
+    planner = EL.make_planner(args, horizon)
+    recorder = None
+    if policy is not None:
+        if args.guidance != "none":
+            default_end = horizon - (args.stride or 10)
+            install_batch_rtc(policy, args.guidance, make_rtc_config(args.schedule, args.max_guidance_weight, default_end))
+        if args.record_entropy or planner.needs_entropy:
+            from h1.attention import CrossAttentionRecorder
+
+            recorder = CrossAttentionRecorder(policy.model).attach()
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy.config, pretrained_path=args.policy,
+            preprocessor_overrides={"device_processor": {"device": args.device}})
+
+    meta = {k: str(v) for k, v in vars(args).items()} | {"horizon": horizon, "planner_repr": repr(planner)}
+    (args.out / "config.json").write_text(json.dumps(meta, indent=2))
+    log.info("H=%d d=%d guidance=%s planner=%s tasks=%s", horizon, args.delay, args.guidance, planner, tasks)
+
+    def make_infer(instruction: str):
+        def infer(observations, noise, leftover, delay, mask_end) -> Chunk:
+            if policy is None:  # hold position: tests the simulator side only
+                state = np.stack([np.asarray(o["agent_pos"], np.float32) for o in observations])
+                acts = np.repeat(state[:, None], horizon, axis=1)
+                n = len(observations)  # flat dummy entropy so entropy-based planners run too
+                return Chunk(torch.as_tensor(acts), acts, np.full((n, horizon), 3.0), np.full(n, 100))
+            batch = preprocessor(to_policy_batch(observations, instruction))
+            kwargs = {}
+            if leftover is not None:
+                kwargs = {"inference_delay": delay, "prev_chunk_left_over": leftover.to(args.device),
+                          "execution_horizon": mask_end}
+            ctx = recorder.record() if recorder else contextlib.nullcontext()
+            with torch.no_grad(), ctx:
+                pred = policy.predict_action_chunk(batch, noise=noise.to(args.device), **kwargs)
+            actions = postprocessor(pred.clone())
+            entropy = n_valid = None
+            if recorder:
+                rec = recorder.result()
+                entropy, n_valid = rec.entropy[:, -1].numpy(), rec.n_valid.numpy()
+            return Chunk(pred.float(), torch.as_tensor(actions).float().cpu().numpy(), entropy, n_valid)
+        return infer
+
+    sims = Simulators(min(args.batch_size, args.episodes_per_task), args, args.out / "sim_logs")
+    try:
+        for task_index, task in enumerate(tasks):
+            out_file = args.out / f"{task}.json"
+            if out_file.exists():
+                log.info("skip %s (done)", task)
+                continue
+            episodes, batches, chunk_log, actions_all = [], [], [], []
+            started = time.time()
+            for start in range(0, args.episodes_per_task, sims.n):
+                ids = list(range(start, min(start + sims.n, args.episodes_per_task)))
+                res = None
+                batch_started = time.time()
+                for attempt in range(2):  # one retry with fresh simulators if a server died
+                    envs = sims.envs[: len(ids)]
+                    try:
+                        for env, i in zip(envs, ids, strict=True):
+                            env.set_episode(task, 100_000 * (1 + args.seed) + 1000 * i)
+                        max_steps = args.max_steps or max(env.step_lim for env in envs)
+                        cfg = LoopConfig(horizon, args.delay, args.guidance != "none", max_steps, args.seed)
+                        if policy is not None:
+                            policy.reset()
+                        instruction = task.replace("_", " ")
+                        res = run_batch(envs, make_infer(instruction), cfg, planner,
+                                        [task_index * 1000 + i for i in ids], noise_shape,
+                                        keep_entropy=args.record_entropy)
+                        break
+                    except (SimulatorError, EOFError, OSError) as e:
+                        log.warning("%s episodes %s: simulator failure (%s), attempt %d", task, ids, e, attempt + 1)
+                        sims.heal()
+                if res is None:
+                    for i in ids:
+                        episodes.append({"task_id": 0, "init_state": i, "success": False, "error": True,
+                                         "length": 0, "n_inference": 0, "sparc": float("nan"),
+                                         "mean_stride": None, "mean_h_star": None, "seed": None})
+                    continue
+                jump_switch, jump_other = switch_jumps(res.actions, res.switch_steps)
+                for b, i in enumerate(ids):
+                    strides = [c["stride"] for c in res.chunks if c["env"] == b]
+                    hs = [c["h_star"] for c in res.chunks if c["env"] == b and c["h_star"] is not None]
+                    episodes.append({
+                        "task_id": 0, "init_state": i, "seed": envs[b].used_seed, "success": bool(res.success[b]),
+                        "error": False, "length": int(res.length[b]), "n_inference": int(res.n_inference[b]),
+                        "sparc": episode_sparc(res.actions[b]),
+                        "mean_stride": float(np.mean(strides)) if strides else None,
+                        "mean_h_star": float(np.mean(hs)) if hs else None,
+                    })
+                batches.append({"task_id": 0, "init_states": ids, "jump_at_switch": jump_switch,
+                                "jump_other": jump_other})
+                for c in res.chunks:
+                    chunk_log.append({"task_id": 0, "init_state": ids[c["env"]]} | {k: v for k, v in c.items() if k != "env"})
+                if args.save_actions:
+                    actions_all.append(res.actions)
+                el = time.time() - started
+                log.info("%s: %d/%d success after %d episodes (%.0f s, %.0f episodes/h, sim %.0f%% of time)",
+                         task, sum(e["success"] for e in episodes), len(episodes), len(episodes), el,
+                         3600 * len(episodes) / max(el, 1e-6),
+                         100 * sum(e.sim_seconds for e in envs) / max((time.time() - batch_started) * len(envs), 1e-6))
+                for env in envs:
+                    env.sim_seconds = 0.0
+            result = EL.summarize(task, episodes, batches, [0])
+            result["seconds"] = time.time() - started
+            result["n_errors"] = sum(bool(e.get("error")) for e in episodes)
+            out_file.write_text(json.dumps(result, indent=1))
+            (args.out / f"{task}_chunks.json").write_text(json.dumps(chunk_log))
+            if actions_all:
+                width = max(a.shape[1] for a in actions_all)
+                padded = [np.pad(a, ((0, 0), (0, width - a.shape[1]), (0, 0)), constant_values=np.nan) for a in actions_all]
+                np.save(args.out / f"{task}_actions.npy", np.concatenate(padded))
+            log.info("%s: success %.1f%% over %d episodes", task, 100 * result["success_rate"], len(episodes))
+    finally:
+        sims.close()
+    EL.write_summary(args.out, tasks)
+    if recorder:
+        recorder.detach()
+
+
+if __name__ == "__main__":
+    main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

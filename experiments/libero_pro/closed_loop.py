@@ -85,7 +85,14 @@ def run_batch(
 ) -> BatchResult:
     """Roll out one episode in each env; each env follows the planner's schedule."""
     n, horizon, d = len(envs), cfg.horizon, cfg.delay
-    observations = [env.reset()[0] for env in envs]
+    # Environments with step_async / step_wait (and reset_async / reset_wait) are driven concurrently.
+    parallel = all(hasattr(env, "step_async") and hasattr(env, "step_wait") for env in envs)
+    if parallel and all(hasattr(env, "reset_async") for env in envs):
+        for env in envs:
+            env.reset_async()
+        observations = [env.reset_wait()[0] for env in envs]
+    else:
+        observations = [env.reset()[0] for env in envs]
     done = np.zeros(n, dtype=bool)
     success = np.zeros(n, dtype=bool)
     length = np.full(n, cfg.max_steps, dtype=np.int64)
@@ -144,12 +151,19 @@ def run_batch(
             generate(t, due)
             activate(t)  # synchronous chunks (first chunk, d = 0) take over immediately
 
-        for b in np.flatnonzero(~done):
+        running = np.flatnonzero(~done)
+        actions_t = {}
+        for b in running:
             action = active_actions[b][t - active_start[b]]
             if executed is None:
                 executed = np.full((n, cfg.max_steps, action.shape[-1]), np.nan, dtype=np.float32)
-            observations[b], _reward, terminated, truncated, info = envs[b].step(action)
-            executed[b, t] = action
+            actions_t[b] = action
+            if parallel:
+                envs[b].step_async(action)  # remote simulators step concurrently
+        for b in running:
+            step = envs[b].step_wait() if parallel else envs[b].step(actions_t[b])
+            observations[b], _reward, terminated, truncated, info = step
+            executed[b, t] = actions_t[b]
             if info.get("is_success", False):
                 success[b], done[b], length[b] = True, True, t + 1
             elif terminated or truncated:
