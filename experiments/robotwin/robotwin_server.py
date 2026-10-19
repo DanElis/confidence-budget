@@ -66,7 +66,18 @@ class _Anything:
 
 
 class _NoCuroboPlanner:
+    """Stands in for RoboTwin's CuroboPlanner. Keeps the parts that do not need CuRobo
+    (gripper interpolation, copied from envs/robot/planner.py); motion planning raises."""
+
     def __init__(self, *args, **kwargs):
+        pass
+
+    def plan_grippers(self, now_val, target_val):
+        num_step = 200
+        return {"num_step": num_step, "per_step": (target_val - now_val) / num_step,
+                "result": np.linspace(now_val, target_val, num_step)}
+
+    def update_point_cloud(self, *args, **kwargs):
         pass
 
     def __getattr__(self, name):
