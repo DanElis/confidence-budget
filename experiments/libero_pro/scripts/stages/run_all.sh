@@ -21,7 +21,7 @@
 #   DELAYS="2 4 8" bash scripts/stages/run_all.sh     # also the other delays (~2.5x longer)
 # Re-running skips finished suites. Progress: runs/all.log; result: runs/report.md
 cd "$(dirname "$0")/../.." && source scripts/stages/lib.sh
-JOBS=${JOBS:-5}
+JOBS=${JOBS:-4}
 EPISODES_Y=${EPISODES_Y:-10}
 EPISODES_X=${EPISODES_X:-50}
 EPISODES_ABL=${EPISODES_ABL:-20}
