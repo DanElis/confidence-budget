@@ -67,6 +67,8 @@ class RemoteEnv:
         self.task, self.seed, self.used_seed, self.step_lim, self.instruction = None, 0, None, None, None
         self.last_obs = None
         self.sim_seconds = 0.0
+        self.outstanding = 0  # requests sent whose replies were not read yet
+        self.episode_error = None
         self._pending = None
 
     # -- protocol -----------------------------------------------------------------------------
@@ -78,6 +80,7 @@ class RemoteEnv:
         if not self.alive:
             raise SimulatorError("simulator server is not running")
         wire.send(self.conn, msg)
+        self.outstanding += 1
 
     def _call(self, msg: dict) -> dict:
         self._send(msg)
@@ -85,10 +88,21 @@ class RemoteEnv:
 
     def _reply(self, cmd: str) -> dict:
         out = wire.recv(self.conn)
+        self.outstanding -= 1
         self.sim_seconds += float(out.get("seconds", 0.0))
         if "error" in out:
             raise SimulatorError(f"{cmd}: {out['error']}")
         return out
+
+    def drain(self) -> None:
+        """Read replies still owed by the server (after an error elsewhere in the batch)."""
+        while self.alive and self.outstanding > 0:
+            try:
+                self._reply("drain")
+            except SimulatorError:
+                pass
+            except (EOFError, OSError):
+                self.conn = None
 
     # -- gym-like API -------------------------------------------------------------------------
     def set_episode(self, task: str, seed: int) -> None:
@@ -102,6 +116,7 @@ class RemoteEnv:
         return self.reset_wait()
 
     def reset_async(self) -> None:
+        self.episode_error = None
         self._send({"cmd": "reset", "seed": self.seed, "max_tries": 50})
 
     def reset_wait(self):
@@ -122,11 +137,13 @@ class RemoteEnv:
         self._pending = None
         try:
             out = self._reply("step")
-        except SimulatorError as e:  # a simulator error ends the episode as a failure
+        except SimulatorError as e:  # ends the episode; eval_robotwin re-runs the batch (episode_error)
+            self.episode_error = str(e)
             return self.last_obs, 0.0, True, False, {"is_success": False, "error": str(e)}
-        except (EOFError, OSError) as e:  # the server died: fail this episode; the next reset raises
+        except (EOFError, OSError) as e:  # the server died: same, and the next reset raises
             self.conn = None
-            return self.last_obs, 0.0, True, False, {"is_success": False, "error": f"server died: {e!r}"}
+            self.episode_error = f"server died: {e!r}"
+            return self.last_obs, 0.0, True, False, {"is_success": False, "error": self.episode_error}
         self.last_obs = out["obs"]
         success = bool(out["success"])
         return self.last_obs, float(success), success, bool(out["done"]) and not success, \

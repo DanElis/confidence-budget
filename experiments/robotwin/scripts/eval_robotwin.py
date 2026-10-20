@@ -43,6 +43,7 @@ from closed_loop import Chunk, LoopConfig, run_batch, sparc, stack_observations,
 from remote_env import RemoteEnv, SimulatorError  # noqa: E402
 
 log = logging.getLogger("eval_robotwin")
+BATCH_ATTEMPTS = 3
 CONTROL_HZ = 25.0  # RoboTwin control frequency
 ARM_JOINTS = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]  # 14-d action without the two grippers
 CAMERAS = ("head_camera", "left_camera", "right_camera")
@@ -120,9 +121,11 @@ class Simulators:
         return RemoteEnv(self.python, None if self.args.fake_sim else self.args.robotwin_root.resolve(),
                          log_path=self.log_dir / f"sim{i}.log", fake=self.args.fake_sim, cameras=CAMERAS)
 
-    def heal(self) -> None:
+    def heal(self, restart_all: bool = False) -> None:
+        """Re-sync live servers (read replies still owed) and restart dead ones (or all)."""
         for i, env in enumerate(self.envs):
-            if not env.alive:
+            env.drain()
+            if restart_all or not env.alive:
                 log.warning("restarting simulator %d", i)
                 env.close()
                 self.envs[i] = self._start(i)
@@ -204,7 +207,8 @@ def main() -> None:
                 ids = list(range(start, min(start + sims.n, args.episodes_per_task)))
                 res = None
                 batch_started = time.time()
-                for attempt in range(2):  # one retry with fresh simulators if a server died
+                failure = None
+                for attempt in range(BATCH_ATTEMPTS):  # retry the batch with re-synced / fresh simulators
                     envs = sims.envs[: len(ids)]
                     try:
                         for env, i in zip(envs, ids, strict=True):
@@ -217,16 +221,23 @@ def main() -> None:
                         res = run_batch(envs, make_infer(instruction), cfg, planner,
                                         [task_index * 1000 + i for i in ids], noise_shape,
                                         keep_entropy=args.record_entropy)
-                        break
+                        errors = [e.episode_error for e in envs if e.episode_error]
+                        if not errors:
+                            break
+                        raise SimulatorError(f"{len(errors)} episode(s) hit a simulator error: {errors[0]}")
                     except (SimulatorError, EOFError, OSError) as e:
-                        log.warning("%s episodes %s: simulator failure (%s), attempt %d", task, ids, e, attempt + 1)
-                        sims.heal()
+                        res, failure = None, str(e)
+                        log.warning("%s episodes %s: simulator failure (%s), attempt %d/%d", task, ids, e,
+                                    attempt + 1, BATCH_ATTEMPTS)
+                        sims.heal(restart_all=attempt > 0)
+                        time.sleep(30 * attempt)
                 if res is None:
-                    for i in ids:
-                        episodes.append({"task_id": 0, "init_state": i, "success": False, "error": True,
-                                         "length": 0, "n_inference": 0, "sparc": float("nan"),
-                                         "mean_stride": None, "mean_h_star": None, "seed": None})
-                    continue
+                    # Never record simulator failures as policy failures: give up on this task without a
+                    # result file, so that a re-run evaluates it again. Out of GPU memory in the renderer
+                    # is reported in the wording lib.sh retries on (after waiting for free memory).
+                    oom = any(s in failure.lower() for s in ("cannot create buffer", "out of memory", "vk_error"))
+                    raise SystemExit(f"{task}: simulator keeps failing ({failure})"
+                                     + ("; CUDA out of memory in the simulator renderer" if oom else ""))
                 jump_switch, jump_other = switch_jumps(res.actions, res.switch_steps)
                 for b, i in enumerate(ids):
                     strides = [c["stride"] for c in res.chunks if c["env"] == b]

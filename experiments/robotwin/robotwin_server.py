@@ -257,6 +257,10 @@ class FakeSim:
                 "agent_pos": self.state.copy()}
 
     def reset(self, seed, max_tries):
+        # tests: ROBOTWIN_FAKE_FAIL=always|<flag file> makes resets fail like an out-of-memory renderer
+        fail = os.environ.get("ROBOTWIN_FAKE_FAIL")
+        if fail == "always" or (fail and not os.path.exists(fail) and open(fail, "w").close() is None):
+            raise RuntimeError("cannot create buffer")
         if seed % 7 == 6:  # "unstable" seeds are skipped like in RoboTwin
             seed += 1
         self.seed, self.t = seed, 0

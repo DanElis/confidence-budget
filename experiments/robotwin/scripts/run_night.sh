@@ -25,8 +25,12 @@ LIBERO_PRO=$HERE/../libero_pro
 export PY=${PY:-"uv run --project $LIBERO_PRO python"}
 export EVAL_SCRIPT=scripts/eval_robotwin.py
 export RUNS=${RUNS:-runs}
-export JOBS=${JOBS:-3}
-export MIN_FREE_MB=${MIN_FREE_MB:-24000}   # policy ~12 GB + simulators
+export JOBS=${JOBS:-2}
+# Each process = policy (~12 GB) + 8 SAPIEN renderers, which allocate GPU memory only at their first
+# reset; too many at once and SAPIEN fails with "cannot create buffer". So: few processes, a large
+# free-memory threshold, and a long pause after each launch for the simulators to take their memory.
+export MIN_FREE_MB=${MIN_FREE_MB:-35000}
+export RESERVE_S=${RESERVE_S:-240}
 export SUITE_TIMEOUT=${SUITE_TIMEOUT:-5h}
 EPISODES=${EPISODES:-50}
 D=${D:-6}

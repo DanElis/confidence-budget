@@ -124,3 +124,26 @@ def test_policy_batch_keys_match_checkpoint():
                           "observation.images.cam_right_wrist", "observation.state", "task"}
     assert batch["observation.images.cam_high"].shape == (2, 3, 240, 320)
     assert batch["observation.state"].shape == (2, 14) and batch["task"] == ["lift pot"] * 2
+
+
+def _eval_cmd(out):
+    return [sys.executable, str(HERE / "scripts" / "eval_robotwin.py"), "--fake-sim", "--fake-policy",
+            "--suites", "lift_pot", "--episodes-per-task", "6", "--batch-size", "3", "--delay", "4",
+            "--stride", "10", "--out", str(out)]
+
+
+def test_batch_is_retried_after_a_simulator_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROBOTWIN_FAKE_FAIL", str(tmp_path / "failed_once"))  # first reset of one server fails
+    r = subprocess.run(_eval_cmd(tmp_path / "run"), capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert "simulator failure" in r.stderr
+    res = json.loads((tmp_path / "run" / "lift_pot.json").read_text())
+    assert res["n_errors"] == 0 and res["n_episodes"] == 6 and res["success_rate"] == 1.0
+
+
+def test_persistent_failure_leaves_no_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROBOTWIN_FAKE_FAIL", "always")
+    r = subprocess.run(_eval_cmd(tmp_path / "run"), capture_output=True, text=True, timeout=300)
+    assert r.returncode != 0
+    assert "CUDA out of memory" in r.stderr  # lib.sh retries on this wording
+    assert not (tmp_path / "run" / "lift_pot.json").exists()
