@@ -147,3 +147,33 @@ def test_persistent_failure_leaves_no_result(tmp_path, monkeypatch):
     assert r.returncode != 0
     assert "CUDA out of memory" in r.stderr  # lib.sh retries on this wording
     assert not (tmp_path / "run" / "lift_pot.json").exists()
+
+
+def test_lazy_observations_match_eager_ones(tmp_path):
+    from remote_env import LazyObs, SimulatorError, resolve_observations
+
+    lazy = [RemoteEnv(sys.executable, None, fake=True, fake_step_lim=60) for _ in range(2)]
+    eager = RemoteEnv(sys.executable, None, fake=True, fake_step_lim=60, lazy_obs=False)
+    try:
+        for e in lazy + [eager]:
+            e.set_episode("t", 4)
+            e.reset()
+        for t in range(5):
+            a = np.full(14, 0.01 * t)
+            for e in lazy:
+                e.step_async(a)
+            obs_l = [e.step_wait()[0] for e in lazy]
+            obs_e = eager.step(a)[0]
+            assert all(isinstance(o, LazyObs) and o.value is None for o in obs_l)
+        got = resolve_observations(obs_l)
+        for o in got:
+            assert np.array_equal(o["pixels"]["head_camera"], obs_e["pixels"]["head_camera"])
+            assert np.allclose(o["agent_pos"], obs_e["agent_pos"])
+        lazy[0].step(np.zeros(14))
+        stale = lazy[0].step(np.zeros(14))[0]
+        lazy[0].step(np.zeros(14))
+        with pytest.raises(SimulatorError, match="stale"):
+            resolve_observations([stale])
+    finally:
+        for e in lazy + [eager]:
+            e.close()

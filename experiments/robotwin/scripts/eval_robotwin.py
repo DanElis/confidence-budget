@@ -40,7 +40,7 @@ for p in (HERE, LIBERO_PRO, LIBERO_PRO / "scripts", HERE.parent / "h1"):
 
 import eval_libero as EL  # noqa: E402  (planner, policy loading, summaries)
 from closed_loop import Chunk, LoopConfig, run_batch, sparc, stack_observations, switch_jumps  # noqa: E402
-from remote_env import RemoteEnv, SimulatorError  # noqa: E402
+from remote_env import RemoteEnv, SimulatorError, resolve_observations  # noqa: E402
 
 log = logging.getLogger("eval_robotwin")
 BATCH_ATTEMPTS = 3
@@ -173,6 +173,7 @@ def main() -> None:
 
     def make_infer(instruction: str):
         def infer(observations, noise, leftover, delay, mask_end) -> Chunk:
+            observations = resolve_observations(observations)  # render the due environments together
             if policy is None:  # hold position: tests the simulator side only
                 state = np.stack([np.asarray(o["agent_pos"], np.float32) for o in observations])
                 acts = np.repeat(state[:, None], horizon, axis=1)

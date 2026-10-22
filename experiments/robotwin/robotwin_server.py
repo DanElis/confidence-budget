@@ -4,7 +4,8 @@
 Started by remote_env.RemoteEnv (cwd = RoboTwin root). Commands (see wire.py for the format):
     {"cmd": "make", "task": name, "cameras": [...]}        -> {"step_lim": int}
     {"cmd": "reset", "seed": int, "max_tries": int}        -> {"obs", "seed", "step_lim", "instruction"}
-    {"cmd": "step", "action": (14,) array}                 -> {"obs", "success", "done", "step"}
+    {"cmd": "step", "action": (14,) array, "want_obs": b}  -> {"obs" (if want_obs), "success", "done", "step"}
+    {"cmd": "obs"}                                         -> {"obs"}   (render now; see remote_env.LazyObs)
     {"cmd": "close"}
 Errors come back as {"error": message}; the server keeps running.
 
@@ -225,13 +226,16 @@ class RealSim:
         state = np.zeros(ACTION_DIM, np.float32) if vec is None else np.asarray(vec, np.float32).ravel()[:ACTION_DIM]
         return {"pixels": images, "agent_pos": state}
 
-    def step(self, action: np.ndarray) -> dict:
+    def step(self, action: np.ndarray, want_obs: bool = True) -> dict:
         with contextlib.redirect_stdout(io.StringIO()):  # take_action prints a progress line per step
             self.env.take_action(np.asarray(action, dtype=np.float64))
         success = bool(self.env.eval_success)
         steps = int(self.env.take_action_cnt)
         done = success or (self.env.step_lim is not None and steps >= self.env.step_lim)
-        return {"obs": self.obs(), "success": success, "done": bool(done), "step": steps}
+        out = {"success": success, "done": bool(done), "step": steps}
+        if want_obs:  # rendering the cameras costs ~70x a physics step; only render when asked
+            out["obs"] = self.obs()
+        return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -267,12 +271,14 @@ class FakeSim:
         self.state = np.zeros(ACTION_DIM, np.float32)
         return {"obs": self.obs(), "seed": seed, "step_lim": self.step_lim, "instruction": f"fake {self.task}"}
 
-    def step(self, action):
+    def step(self, action, want_obs=True):
         self.t += 1
         self.state = np.asarray(action, np.float32)
         success = self.seed % 2 == 0 and self.t >= 20 + self.seed % 30
-        return {"obs": self.obs(), "success": bool(success), "done": bool(success or self.t >= self.step_lim),
-                "step": self.t}
+        out = {"success": bool(success), "done": bool(success or self.t >= self.step_lim), "step": self.t}
+        if want_obs:
+            out["obs"] = self.obs()
+        return out
 
 
 def serve(args) -> None:
@@ -298,7 +304,9 @@ def serve(args) -> None:
                     elif cmd == "reset":
                         out = sim.reset(int(msg["seed"]), int(msg.get("max_tries", 50)))
                     elif cmd == "step":
-                        out = sim.step(msg["action"])
+                        out = sim.step(msg["action"], bool(msg.get("want_obs", True)))
+                    elif cmd == "obs":
+                        out = {"obs": sim.obs()}
                     else:
                         out = {"error": f"unknown command {cmd!r}"}
                 except Exception as e:  # keep serving; the client decides what an error means

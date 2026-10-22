@@ -33,11 +33,50 @@ class SimulatorError(RuntimeError):
     pass
 
 
+class LazyObs:
+    """Observation of a RemoteEnv after a step, rendered only when someone looks at it.
+
+    RoboTwin's camera rendering costs ~70x a physics step, and the policy only reads observations
+    at inference steps (every s steps), so steps are sent with want_obs=False. Use
+    resolve_observations() to render several environments concurrently; item access renders
+    a single one.
+    """
+
+    def __init__(self, env: "RemoteEnv", step: int):
+        self.env, self.step, self.value = env, step, None
+
+    def get(self) -> dict:
+        if self.value is None:
+            resolve_observations([self])
+        return self.value
+
+    def __getitem__(self, key):
+        return self.get()[key]
+
+    def keys(self):
+        return self.get().keys()
+
+
+def resolve_observations(observations: list) -> list:
+    """Replace LazyObs entries by real observations, rendering all of them at once."""
+    pending = [o for o in observations if isinstance(o, LazyObs) and o.value is None]
+    for o in pending:
+        if o.env.step_count != o.step:
+            raise SimulatorError("stale observation: the environment has stepped since")
+        o.env._send({"cmd": "obs"})
+    for o in pending:
+        o.value = o.env._reply("obs")["obs"]
+        o.env.last_obs = o.value
+    return [o.value if isinstance(o, LazyObs) else o for o in observations]
+
+
 class RemoteEnv:
     def __init__(self, python: str, robotwin_root: str | Path | None, log_path: str | Path | None = None,
                  fake: bool = False, fake_step_lim: int = 60, start_timeout: float = 600.0,
-                 cameras=("head_camera", "left_camera", "right_camera")):
+                 cameras=("head_camera", "left_camera", "right_camera"), lazy_obs: bool = True):
         self.cameras = list(cameras)
+        self.lazy_obs = lazy_obs
+        self.step_count = 0
         self.address = os.path.join(tempfile.gettempdir(), f"robotwin-{uuid.uuid4().hex[:12]}.sock")
         cmd = [python, str(SERVER), "--address", self.address]
         if fake:
@@ -123,6 +162,7 @@ class RemoteEnv:
         out = self._reply("reset")
         self.used_seed, self.step_lim, self.instruction = int(out["seed"]), int(out["step_lim"]), out["instruction"]
         self.last_obs = out["obs"]
+        self.step_count = 0
         return self.last_obs, {"seed": self.used_seed}
 
     def step(self, action):
@@ -130,7 +170,7 @@ class RemoteEnv:
         return self.step_wait()
 
     def step_async(self, action) -> None:
-        self._send({"cmd": "step", "action": np.asarray(action, dtype=np.float64)})
+        self._send({"cmd": "step", "action": np.asarray(action, dtype=np.float64), "want_obs": not self.lazy_obs})
         self._pending = True
 
     def step_wait(self):
@@ -144,7 +184,8 @@ class RemoteEnv:
             self.conn = None
             self.episode_error = f"server died: {e!r}"
             return self.last_obs, 0.0, True, False, {"is_success": False, "error": self.episode_error}
-        self.last_obs = out["obs"]
+        self.step_count += 1
+        self.last_obs = out["obs"] if "obs" in out else LazyObs(self, self.step_count)
         success = bool(out["success"])
         return self.last_obs, float(success), success, bool(out["done"]) and not success, \
             {"is_success": success, "step": int(out["step"])}
