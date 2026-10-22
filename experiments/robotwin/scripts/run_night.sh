@@ -25,11 +25,13 @@ LIBERO_PRO=$HERE/../libero_pro
 export PY=${PY:-"uv run --project $LIBERO_PRO python"}
 export EVAL_SCRIPT=scripts/eval_robotwin.py
 export RUNS=${RUNS:-runs}
-export JOBS=${JOBS:-2}
-# Each process = policy (~12 GB) + 8 SAPIEN renderers, which allocate GPU memory only at their first
-# reset; too many at once and SAPIEN fails with "cannot create buffer". So: few processes, a large
-# free-memory threshold, and a long pause after each launch for the simulators to take their memory.
-export MIN_FREE_MB=${MIN_FREE_MB:-35000}
+# GPU memory measured on an A100: policy ~11 GB, one SAPIEN simulator ~3.6 GB once its scene is
+# loaded (it starts at ~0.9 GB and grows at the first reset). The simulator is the bottleneck
+# (~99% of the time), so one process with many simulators beats several processes with fewer:
+# one copy of the model, more simulators. Default: 1 process x 12 simulators ~ 55 GB.
+export JOBS=${JOBS:-1}
+BATCH=${BATCH:-12}
+export MIN_FREE_MB=${MIN_FREE_MB:-$((12000 + BATCH * 3800))}
 export RESERVE_S=${RESERVE_S:-240}
 export SUITE_TIMEOUT=${SUITE_TIMEOUT:-5h}
 EPISODES=${EPISODES:-50}
@@ -39,7 +41,7 @@ source "$LIBERO_PRO/scripts/stages/lib.sh"
 
 main() {
 trap 'trap - INT TERM; kill 0' INT TERM
-echo "$(date '+%F %T') RoboTwin night: tasks=$TASKS episodes=$EPISODES d=$D jobs=$JOBS"
+echo "$(date '+%F %T') RoboTwin night: tasks=$TASKS episodes=$EPISODES d=$D jobs=$JOBS batch=$BATCH min_free=${MIN_FREE_MB}MB"
 
 # 0. sanity ----------------------------------------------------------------------------
 EPISODES=10 run_eval sanity_sync_s50 beat_block_hammer ${EXTRA:-} --stride 50 --delay 0 --guidance none
@@ -52,7 +54,7 @@ if (( ok < 5 )); then
 fi
 
 # 1. grid --------------------------------------------------------------------------------
-E=(--batch-size 8 ${EXTRA:-})   # EXTRA="--fake-sim --fake-policy" dry-runs the script without RoboTwin
+E=(--batch-size "$BATCH" ${EXTRA:-})   # EXTRA="--fake-sim --fake-policy" dry-runs the script without RoboTwin
 EPISODES=$EPISODES run_eval sync_s50            "$TASKS" "${E[@]}" --stride 50 --delay 0 --guidance none
 EPISODES=$EPISODES run_eval sync_s25            "$TASKS" "${E[@]}" --stride 25 --delay 0 --guidance none --record-entropy
 EPISODES=$EPISODES run_eval naive_s25_d$D       "$TASKS" "${E[@]}" --stride 25 --delay "$D" --guidance none
