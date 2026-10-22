@@ -1,5 +1,8 @@
 # Бюджет уверенности: совместный выбор шага перепланирования и маски в чанкинге реального времени
 
+Код проверки гипотезы H1: [experiments/h1](experiments/h1).
+Замкнутый контур на LIBERO / LIBERO-Pro: [experiments/libero_pro](experiments/libero_pro).
+
 ## 1. Мотивация
 
 Современные VLA-модели, такие как $\pi_0$ [3], $\pi_{0.5}$ [4] и GR00T [5], управляют роботом через чанкинг действий: по одному наблюдению политика предсказывает последовательность из $H$ будущих действий и до следующего перепланирования исполняет её префикс, как правило, короче всего чанка [1, 2, 7]. Чанкинг даёт временную согласованность, но порождает компромисс: длинное исполнение без перепланирования снижает реактивность, короткое ведёт к перескокам между стратегиями на стыках чанков [6, 7].
@@ -141,3 +144,4 @@ $$h^* = \min(\mathcal{C}) + k, \quad \text{если } \mathcal{C} \ne \varnothin
 22. Chen T. et al. RoboTwin 2.0: A Scalable Data Generator and Benchmark with Strong Domain Randomization for Robust Bimanual Robotic Manipulation. arXiv:2506.18088, 2025.
 23. Matthews M., Beukman M., Lu C., Foerster J. Kinetix: Investigating the Training of General Agents through Open-Ended Physics-Based Control Tasks. arXiv:2410.23208, 2024.
 24. Balasubramanian S. et al. On the Analysis of Movement Smoothness. Journal of NeuroEngineering and Rehabilitation, 12, 2015.
+- [`experiments/robotwin`](experiments/robotwin): RoboTwin 2.0, π0.5 — синхронный / асинхронный чанкинг, RTC и бюджет.
