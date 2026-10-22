@@ -25,13 +25,13 @@ LIBERO_PRO=$HERE/../libero_pro
 export PY=${PY:-"uv run --project $LIBERO_PRO python"}
 export EVAL_SCRIPT=scripts/eval_robotwin.py
 export RUNS=${RUNS:-runs}
-# GPU memory measured on an A100: policy ~11 GB, one SAPIEN simulator ~3.6 GB once its scene is
-# loaded (it starts at ~0.9 GB and grows at the first reset). The simulator is the bottleneck
-# (~99% of the time), so one process with many simulators beats several processes with fewer:
-# one copy of the model, more simulators. Default: 1 process x 12 simulators ~ 55 GB.
+# GPU memory measured on an A100: policy ~11 GB, one SAPIEN simulator 3.6-5 GB once its scene is
+# loaded (depends on the task; it starts at ~0.9 GB and grows at the first reset). The simulator is
+# the bottleneck, so one process with many simulators beats several processes with fewer.
+# Default: 1 process x 8 simulators, <= ~51 GB; 12 simulators already overflowed 80 GB on lift_pot.
 export JOBS=${JOBS:-1}
-BATCH=${BATCH:-12}
-export MIN_FREE_MB=${MIN_FREE_MB:-$((12000 + BATCH * 3800))}
+BATCH=${BATCH:-8}
+export MIN_FREE_MB=${MIN_FREE_MB:-$((12000 + BATCH * 5000))}
 export RESERVE_S=${RESERVE_S:-240}
 export SUITE_TIMEOUT=${SUITE_TIMEOUT:-5h}
 EPISODES=${EPISODES:-50}
