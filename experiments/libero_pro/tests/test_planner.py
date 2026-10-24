@@ -79,3 +79,10 @@ def test_entropy_lambda_goes_up_with_unusual_entropy():
     low = np.full(H, 0.58 * math.log(n))
     assert lam(normal, n) == pytest.approx(0.5)
     assert lam(high, n) == 1.0 and lam(low, n) == 0.0
+
+
+def test_above_rule():
+    x = np.concatenate([np.full(12, 0.1), np.full(H - 12, 0.5)])
+    assert hstar(x, 500, HStarRule("above", eta=0.3, k=1, min_h=5)) == 12
+    assert hstar(x, 500, HStarRule("above", eta=0.9, k=1)) == H
+    assert hstar(np.full(H, 0.5), 500, HStarRule("above", eta=0.3, k=1, min_h=5)) == 5

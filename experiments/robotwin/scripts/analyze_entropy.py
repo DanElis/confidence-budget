@@ -146,6 +146,8 @@ def perm_pvalue(eps: list[dict], feat: str, n_perm: int, rng) -> float:
         groups.setdefault(e["task"], []).append(i)
     groups = [np.array(g) for g in groups.values()]
     obs = abs(auroc(score, fail) - 0.5)
+    if not np.isfinite(obs):
+        return float("nan")
     hits = 0
     for _ in range(n_perm):
         perm = fail.copy()
@@ -227,6 +229,9 @@ def verdict(summaries: dict) -> str:
             continue
         point, lo, hi = s[PRIMARY]
         pval = s["_p"]
+        if not np.isfinite(pval):
+            lines.append(f"- {run}: not computable (only one outcome)")
+            continue
         if pval < 0.05:
             direction = "higher" if point > 0.5 else "lower"
             lines.append(f"- {run}: signal. {PRIMARY}: AUROC {point:.3f} [{lo:.3f}; {hi:.3f}], permutation p = {pval:.4f} "

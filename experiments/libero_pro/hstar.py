@@ -8,6 +8,8 @@ Rules (all 0-based internally; h* is a number of actions in [1, H]):
   h* = first j where it reaches ``q`` and stays there for ``k`` steps, + 1.
 * ``rise``      - h* = position of the largest increase of the smoothed
   curve (like AAC's argmax of entropy growth), at least ``min_h``.
+* ``above``     - h* = first j where the smoothed signal reaches ``eta`` (an absolute level, e.g.
+  for the dispersion across noise samples, as in AAC), at least ``min_h``.
 * ``const``     - h* = ``c`` regardless of the entropy (baseline for calibration).
 
 If no rule fires, h* = H.
@@ -20,7 +22,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-RULES = ("absolute", "relative", "rise", "const")
+RULES = ("absolute", "relative", "rise", "above", "const")
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,10 @@ def hstar(entropy: np.ndarray, n_valid: int, rule: HStarRule) -> int:
             if above[j : j + rule.k].all():
                 return int(max(j + 1, 1))
         return horizon
+    if rule.kind == "above":
+        hits = np.flatnonzero(bar >= rule.eta)
+        j = int(hits[0]) if hits.size else horizon
+        return int(min(max(j, rule.min_h), horizon))
     if rule.kind == "rise":
         grow = np.diff(bar)
         j = int(np.argmax(grow)) + 1

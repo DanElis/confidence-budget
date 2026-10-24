@@ -177,3 +177,23 @@ def test_lazy_observations_match_eager_ones(tmp_path):
     finally:
         for e in lazy + [eager]:
             e.close()
+
+
+def test_samples_and_plans_are_logged(tmp_path):
+    out = tmp_path / "run"
+    cmd = _eval_cmd(out) + ["--n-samples", "4", "--record-plans"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stderr[-3000:]
+    chunks = json.loads((out / "lift_pot_chunks.json").read_text())
+    assert len(chunks[0]["dispersion"]) == 50 and np.asarray(chunks[0]["plan"]).shape == (50, 14)
+
+
+def test_expand_noise_keeps_sample_zero_and_is_deterministic():
+    sys.path.insert(0, str(HERE / "scripts"))
+    import torch
+    from eval_robotwin import expand_noise
+
+    base = torch.randn(3, 50, 32)
+    a, b = expand_noise(base, 4), expand_noise(base, 4)
+    assert a.shape == (12, 50, 32) and torch.equal(a, b)
+    assert torch.equal(a[::4], base) and not torch.equal(a[1], a[2])

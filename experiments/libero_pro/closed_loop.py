@@ -49,6 +49,10 @@ class Chunk:
     actions: np.ndarray  # (B, H, A) environment actions
     entropy: np.ndarray | None = None  # (B, H) cross-attention entropy (last denoising step)
     n_valid: np.ndarray | None = None  # (B,) number of valid prefix tokens (entropy normaliser)
+    # (B, H) per-action signal the planner reads instead of the entropy (e.g. dispersion across noise samples)
+    signal: np.ndarray | None = None
+    # name -> (B, ...) arrays stored in the chunk log when keep_entropy (e.g. "dispersion", "plan")
+    extras: dict = field(default_factory=dict)
 
 
 # infer(observations, noise (B,H,A_max), leftover (B,H,A) zero-padded | None, delay, mask_end (B,) | None) -> Chunk
@@ -122,7 +126,8 @@ def run_batch(
         for i, b in enumerate(due):
             entropy = None if chunk.entropy is None else np.asarray(chunk.entropy[i])
             n_valid = None if chunk.n_valid is None else int(chunk.n_valid[i])
-            plan = planner(entropy, n_valid, d)
+            signal = entropy if chunk.signal is None else np.asarray(chunk.signal[i])
+            plan = planner(signal, n_valid, d)
             switch = t if first else t + d
             pending[b] = (chunk.model[i].detach(), np.asarray(chunk.actions[i]), t, switch)
             next_start[b] = t + plan.stride
@@ -133,6 +138,9 @@ def run_batch(
             if keep_entropy and entropy is not None:
                 record["entropy"] = entropy.astype(np.float32).tolist()
                 record["n_valid"] = n_valid
+            if keep_entropy:
+                for name, values in chunk.extras.items():
+                    record[name] = np.asarray(values[i], dtype=np.float32).round(5).tolist()
             chunks.append(record)
 
     def activate(t: int) -> None:

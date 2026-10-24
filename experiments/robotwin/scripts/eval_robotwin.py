@@ -45,7 +45,8 @@ from remote_env import RemoteEnv, SimulatorError, resolve_observations  # noqa: 
 log = logging.getLogger("eval_robotwin")
 BATCH_ATTEMPTS = 3
 CONTROL_HZ = 25.0  # RoboTwin control frequency
-ARM_JOINTS = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]  # 14-d action without the two grippers
+ARM_JOINTS = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+ACTION_DIM = 14  # 14-d action without the two grippers
 CAMERAS = ("head_camera", "left_camera", "right_camera")
 # RoboTwin camera names -> feature names of SidneyXie/pi05_robotwin (its README's --rename_map)
 RENAME = {"observation.images.head_camera": "observation.images.cam_high",
@@ -79,7 +80,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--lam", default="0.5")
     p.add_argument("--lam-config", type=Path, default=None)
     p.add_argument("--r-min", type=int, default=5)
-    p.add_argument("--record-entropy", action="store_true")
+    p.add_argument("--record-entropy", action="store_true", help="store entropy and the extras below per chunk")
+    p.add_argument("--n-samples", type=int, default=1,
+                   help="K > 1: generate K chunks per observation (different noise) and store their dispersion per "
+                        "action index; the robot executes sample 0, which uses the same noise as a K = 1 run")
+    p.add_argument("--signal", choices=["entropy", "dispersion"], default="entropy",
+                   help="what the budget planner's h* rule reads (dispersion needs --n-samples > 1)")
+    p.add_argument("--record-plans", action="store_true", help="store each chunk's actions (policy space) for drift analysis")
     p.add_argument("--save-actions", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -88,6 +95,18 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="hold the current joint state instead of running the model (tests the simulator)")
     p.add_argument("--out", type=Path, required=True)
     return p.parse_args(argv)
+
+
+def expand_noise(noise: torch.Tensor, k: int) -> torch.Tensor:
+    """(B, H, A) -> (B*K, H, A): sample 0 of each row is the given noise, the others are drawn
+    deterministically from it (same scenes, same extra samples in every run)."""
+    out = []
+    for row in noise:
+        out.append(row)
+        seed = int(abs(float(row.flatten()[:16].double().sum())) * 1e9) % (2**62)
+        g = torch.Generator().manual_seed(seed)
+        out += [torch.randn(row.shape, generator=g, dtype=row.dtype) for _ in range(k - 1)]
+    return torch.stack(out)
 
 
 def episode_sparc(actions: np.ndarray) -> float:
@@ -154,6 +173,8 @@ def main() -> None:
     if args.planner == "fixed" and args.stride is None:
         args.stride = n_action_steps
     planner = EL.make_planner(args, horizon)
+    if args.signal == "dispersion" and args.n_samples < 2:
+        raise SystemExit("--signal dispersion needs --n-samples >= 2")
     recorder = None
     if policy is not None:
         if args.guidance != "none":
@@ -178,7 +199,19 @@ def main() -> None:
                 state = np.stack([np.asarray(o["agent_pos"], np.float32) for o in observations])
                 acts = np.repeat(state[:, None], horizon, axis=1)
                 n = len(observations)  # flat dummy entropy so entropy-based planners run too
-                return Chunk(torch.as_tensor(acts), acts, np.full((n, horizon), 3.0), np.full(n, 100))
+                extras = {"dispersion": np.tile(np.linspace(0.05, 0.5, horizon), (n, 1))} if args.n_samples > 1 else {}
+                if args.record_plans:
+                    extras["plan"] = acts[..., :ACTION_DIM]
+                sig = extras.get("dispersion") if args.signal == "dispersion" else None
+                return Chunk(torch.as_tensor(acts), acts, np.full((n, horizon), 3.0), np.full(n, 100),
+                             signal=sig, extras=extras)
+            k = args.n_samples
+            n = len(observations)
+            if k > 1:  # K chunks per observation with different noise; sample 0 keeps the episode's noise
+                observations = [o for o in observations for _ in range(k)]
+                noise = expand_noise(noise, k)
+                if leftover is not None:
+                    leftover, mask_end = leftover.repeat_interleave(k, 0), mask_end.repeat_interleave(k, 0)
             batch = preprocessor(to_policy_batch(observations, instruction))
             kwargs = {}
             if leftover is not None:
@@ -187,12 +220,25 @@ def main() -> None:
             ctx = recorder.record() if recorder else contextlib.nullcontext()
             with torch.no_grad(), ctx:
                 pred = policy.predict_action_chunk(batch, noise=noise.to(args.device), **kwargs)
-            actions = postprocessor(pred.clone())
             entropy = n_valid = None
             if recorder:
                 rec = recorder.result()
-                entropy, n_valid = rec.entropy[:, -1].numpy(), rec.n_valid.numpy()
-            return Chunk(pred.float(), torch.as_tensor(actions).float().cpu().numpy(), entropy, n_valid)
+                entropy, n_valid = rec.entropy[:, -1].numpy()[::k], rec.n_valid.numpy()[::k]
+            pred = pred.float()
+            extras, signal = {}, None
+            if k > 1:
+                samples = pred[:, :, :ACTION_DIM].reshape(n, k, horizon, ACTION_DIM)
+                # dispersion: std across samples in the normalised action space, averaged over the 14 joints
+                dispersion = samples.std(dim=1, unbiased=True).mean(dim=-1).cpu().numpy()
+                extras["dispersion"] = dispersion
+                if args.signal == "dispersion":
+                    signal = dispersion
+                pred = pred[::k]
+            if args.record_plans:
+                extras["plan"] = pred[:, :, :ACTION_DIM].cpu().numpy()
+            actions = postprocessor(pred.clone())
+            return Chunk(pred, torch.as_tensor(actions).float().cpu().numpy(), entropy, n_valid,
+                         signal=signal, extras=extras)
         return infer
 
     sims = Simulators(min(args.batch_size, args.episodes_per_task), args, args.out / "sim_logs")
@@ -221,7 +267,7 @@ def main() -> None:
                         instruction = task.replace("_", " ")
                         res = run_batch(envs, make_infer(instruction), cfg, planner,
                                         [task_index * 1000 + i for i in ids], noise_shape,
-                                        keep_entropy=args.record_entropy)
+                                        keep_entropy=args.record_entropy or args.record_plans or args.n_samples > 1)
                         errors = [e.episode_error for e in envs if e.episode_error]
                         if not errors:
                             break
