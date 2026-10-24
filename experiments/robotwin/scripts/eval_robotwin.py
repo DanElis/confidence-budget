@@ -72,7 +72,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--guidance", choices=["none", "lerobot", "exact"], default="none")
     p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"])
     p.add_argument("--max-guidance-weight", type=float, default=10.0)
-    p.add_argument("--planner", choices=["fixed", "budget"], default="fixed")
+    p.add_argument("--planner", choices=["fixed", "budget", "adaptive"], default="fixed",
+                   help="adaptive: s = h* - d from the --signal (AAC-style adaptive chunking)")
+    p.add_argument("--s-min", type=int, default=5, help="adaptive: smallest step")
     p.add_argument("--stride", type=int, default=None, help="fixed: s; default: the checkpoint's n_action_steps")
     p.add_argument("--mask-end", type=int, default=None)
     p.add_argument("--hstar-config", type=Path, default=None)

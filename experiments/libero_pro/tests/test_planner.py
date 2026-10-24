@@ -86,3 +86,15 @@ def test_above_rule():
     assert hstar(x, 500, HStarRule("above", eta=0.3, k=1, min_h=5)) == 12
     assert hstar(x, 500, HStarRule("above", eta=0.9, k=1)) == H
     assert hstar(np.full(H, 0.5), 500, HStarRule("above", eta=0.3, k=1, min_h=5)) == 5
+
+
+def test_adaptive_planner():
+    from planner import AdaptivePlanner
+
+    x = np.concatenate([np.full(30, 0.1), np.full(H - 30, 0.5)])
+    rule = HStarRule("above", eta=0.3, k=1, min_h=5)
+    assert AdaptivePlanner(H, rule)(x, 500, 0).stride == 30  # synchronous: execute up to h*
+    plan = AdaptivePlanner(H, rule)(x, 500, 6)
+    assert plan.stride == 24 and plan.mask_end == H - 24 and plan.h_star == 30
+    assert AdaptivePlanner(H, rule)(np.full(H, 0.9), 500, 0).stride == 5  # s_min
+    assert AdaptivePlanner(H, rule)(np.full(H, 0.0), 500, 6).stride == H - 6  # never uncertain

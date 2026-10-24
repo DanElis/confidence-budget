@@ -97,6 +97,31 @@ class BudgetPlanner:
         return budget_plan(h, delay, self.r_min, lam, self.horizon, self.s_min)
 
 
+@dataclass(frozen=True)
+class AdaptivePlanner:
+    """Adaptive chunking (as in AAC): execute the chunk up to its reliable horizon, then replan.
+
+    s = clip(h* - d, s_min, s_max), so that the switch to the next chunk (d steps after its
+    inference started) happens no later than h*. No budget for the guided window: with guidance
+    the mask covers the rest of the leftover (H - s), as in ordinary RTC.
+    """
+
+    horizon: int
+    rule: HStarRule
+    s_min: int = 5
+    s_max: int | None = None
+
+    @property
+    def needs_entropy(self) -> bool:
+        return True
+
+    def __call__(self, signal: np.ndarray, n_valid: int, delay: int) -> Plan:
+        h = self.rule(signal, n_valid)
+        s_max = self.horizon - delay if self.s_max is None else min(self.s_max, self.horizon - delay)
+        s = int(min(max(h - delay, self.s_min, max(delay, 1)), s_max))
+        return Plan(stride=s, mask_end=self.horizon - s, h_star=int(h))
+
+
 def budget_plan(h_star: int, delay: int, r_min: int, lam: float, horizon: int, s_min: int = 1) -> Plan:
     d = delay
     s_floor = max(d, s_min)

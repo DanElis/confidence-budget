@@ -45,7 +45,7 @@ from libero_pro_suites import (  # noqa: E402
     register_position_suites,
     suite_name,
 )
-from planner import BudgetPlanner, EntropyLambda, FixedPlanner  # noqa: E402
+from planner import AdaptivePlanner, BudgetPlanner, EntropyLambda, FixedPlanner  # noqa: E402
 
 log = logging.getLogger("eval_libero")
 CONTROL_HZ = 20.0  # LIBERO / robosuite control frequency
@@ -66,7 +66,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"])
     p.add_argument("--max-guidance-weight", type=float, default=10.0)
     # planner
-    p.add_argument("--planner", choices=["fixed", "budget"], default="fixed")
+    p.add_argument("--planner", choices=["fixed", "budget", "adaptive"], default="fixed")
     p.add_argument("--stride", type=int, default=None, help="fixed: s; default: the checkpoint's n_action_steps")
     p.add_argument("--mask-end", type=int, default=None, help="fixed: RTC soft-mask end; default H - s")
     p.add_argument("--hstar-config", type=Path, default=None, help="budget: JSON with the h* rule (calibrate_hstar.py)")
@@ -119,7 +119,9 @@ def make_planner(args, horizon: int):
     elif args.hstar_config:
         rule = HStarRule.from_dict(json.loads(args.hstar_config.read_text())["rule"])
     else:
-        raise SystemExit("--planner budget needs --hstar-config or --hstar-rule")
+        raise SystemExit(f"--planner {args.planner} needs --hstar-config or --hstar-rule")
+    if args.planner == "adaptive":
+        return AdaptivePlanner(horizon, rule, s_min=getattr(args, "s_min", 5))
     if args.lam == "entropy":
         if args.lam_config is None:
             raise SystemExit("--lam entropy needs --lam-config")
