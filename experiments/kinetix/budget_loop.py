@@ -11,6 +11,11 @@ Each --config is ``label:key=value,...`` with keys of budget.LoopConfig (d defau
     ada:guidance=1,planner=adaptive,rule=above,eta=0.03,n_samples=8
     b_aac:guidance=1,planner=budget,rule=aac,min_h=1,lam=0.5,n_samples=8      h* as in AAC, no threshold to calibrate
     ada_aac:guidance=1,planner=adaptive,rule=aac,min_h=1,n_samples=8
+    conf1:guidance=1,s=2,n_samples=8,mask_mode=rtc_x_conf,conf_sigma=1,conf_ref=0.05   RTC mask * exp(-D_old / sigma)
+    coh:guidance=1,s=2,n_samples=8,select=coherent                  noise of the sample closest to the old leftover
+    med:guidance=1,s=2,n_samples=8,select=medoid                    control: consensus sample, no reference to the old plan
+
+conf_ref: median dispersion of a reference run (``--calibrate LABEL`` prints it); conf_sigma is in its units.
 
 Protocol (CLAUDE.md): environments, resets and noise are shared by all configs of a run (paired); Δ is reported
 against the first config with the same d, with a 95% bootstrap CI over environments (stratified by level).
@@ -20,7 +25,7 @@ Outputs in --out: <label>.npz (per-environment results, logs of the first --n-lo
 results.csv (per config x level), report.md.
 
     ./run.sh budget_loop.py --delay 2 --config naive:s=2 --config rtc:guidance=1,s=2 --out runs/budget_d2
-    ./run.sh budget_loop.py --out runs/budget_d2 --calibrate rtc_k8 --target-h 6
+    ./run.sh budget_loop.py --out runs/budget_d2 --calibrate rtc_k8 [--target-h 6]
 """
 
 import argparse
@@ -49,7 +54,7 @@ sys.path.insert(0, str(run_points.HERE))
 import budget  # noqa: E402
 
 PER_ENV = ("solved", "ret", "length", "unfinished", "n_infer", "mean_s", "mean_h", "mean_mask", "mean_lam",
-           "jump_switch", "jump_other")
+           "frac_sel", "jump_switch", "jump_other")
 
 
 def parse_config(spec: str, delay: int) -> tuple[str, budget.LoopConfig]:
@@ -183,11 +188,12 @@ def write_report(out: pathlib.Path, labels: list[str], level_names: list[str]):
     lines += [
         "Solve rate of the first episode, mean over levels; Δ to the first config with the same d, "
         "95% bootstrap CI over environments. infer/ep — policy calls per episode (incl. the first chunk); "
-        "s, h*, mask end (= d + r), λ — means over plans; jump — mean L2 action change at chunk switches / elsewhere.",
+        "s, h*, mask end (= d + r), λ — means over plans; sel — share of chunks where a sample other than 0 was "
+        "executed; jump — mean L2 action change at chunk switches / elsewhere.",
         "",
-        "| config | d | SR, % | Δ, p.p. [95% CI] | infer/ep | s | h* | mask end | λ | jump switch / other "
+        "| config | d | SR, % | Δ, p.p. [95% CI] | infer/ep | s | h* | mask end | λ | sel | jump switch / other "
         "| unfinished | compile, s | run, s | peak GPU, MB |",
-        "|---" * 14 + "|",
+        "|---" * 15 + "|",
     ]
     for lab in labels:
         r, c = runs[lab], cfgs[lab]
@@ -201,6 +207,7 @@ def write_report(out: pathlib.Path, labels: list[str], level_names: list[str]):
         lines.append(
             f"| {lab} | {c['d']} | {solved.mean():.1f} | {delta} | {r['n_infer'].mean():.1f} | {r['mean_s'].mean():.2f} "
             f"| {r['mean_h'].mean():.2f} | {r['mean_mask'].mean():.2f} | {r['mean_lam'].mean():.2f} "
+            f"| {r['frac_sel'].mean():.2f} "
             f"| {r['jump_switch'].mean():.3f} / {r['jump_other'].mean():.3f} | {int(r['unfinished'].sum())} "
             f"| {float(r['compile_s']):.0f} | {float(r['run_s']):.0f} | {float(r['peak_gpu_mb']):.0f} |"
         )
@@ -217,12 +224,17 @@ def write_report(out: pathlib.Path, labels: list[str], level_names: list[str]):
     pd.DataFrame(rows).to_csv(out / "results.csv", index=False)
 
 
-def calibrate(out: pathlib.Path, label: str, target: float, k: int, min_h: int, zone: int):
-    """eta of the 'above' rule giving mean h* = target over the logged plans of ``label``; mu / sigma for lam_mode z."""
+def calibrate(out: pathlib.Path, label: str, target: float | None, k: int, min_h: int, zone: int):
+    """From the logged plans of ``label`` (no outcomes): conf_ref = median dispersion; with ``target``, eta of the
+    'above' rule giving mean h* = target, and mu / sigma for lam_mode z."""
     r = np.load(out / f"{label}.npz")
     disp = r["log_disp"][r["log_due"]]  # (n_plans, H)
     if not np.any(disp):
         raise SystemExit(f"{label}: no dispersion logged (needs n_samples > 1 and --n-log > 0)")
+    print(f"{label}: {len(disp)} plans; median dispersion {np.median(disp):.5g} -> use conf_ref={np.median(disp):.5g}")
+    print(f"profile (mean dispersion per action index): {np.round(disp.mean(0), 5).tolist()}")
+    if target is None:
+        return
 
     def mean_h(eta):
         cfg = budget.LoopConfig(rule="above", eta=float(eta), k=k, min_h=min_h, n_samples=2)
@@ -234,9 +246,8 @@ def calibrate(out: pathlib.Path, label: str, target: float, k: int, min_h: int, 
         lo, hi = (mid, hi) if mean_h(mid) < target else (lo, mid)
     eta = (lo + hi) / 2
     early = disp[:, :zone].mean(1)
-    print(f"{label}: {len(disp)} plans; eta={eta:.5g} -> mean h* {mean_h(eta):.2f} (target {target}); "
+    print(f"eta={eta:.5g} -> mean h* {mean_h(eta):.2f} (target {target}); "
           f"early zone {zone}: mu={early.mean():.5g} sigma={early.std():.5g}")
-    print(f"profile (mean dispersion per action index): {np.round(disp.mean(0), 5).tolist()}")
     print(f"use: rule=above,eta={eta:.5g},k={k},min_h={min_h}  /  lam_mode=z,mu={early.mean():.5g},"
           f"sigma={early.std():.5g},zone={zone}")
 
@@ -261,8 +272,6 @@ def main():
     out = pathlib.Path(args.out).resolve()
 
     if args.calibrate:
-        if args.target_h is None:
-            raise SystemExit("--calibrate needs --target-h")
         calibrate(out, args.calibrate, args.target_h, args.k, args.min_h, args.zone)
         return
     if not args.config:

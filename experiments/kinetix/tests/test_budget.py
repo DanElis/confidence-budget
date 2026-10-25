@@ -195,3 +195,99 @@ def test_aac_schedule(planner, d, lam):
         want, plans = reference(d, num_steps, stride_at)
         np.testing.assert_array_equal(got[:, b], want)
         assert np.flatnonzero(np.asarray(logs["due"])[:, 0, b]).tolist() == [t for t, _ in plans]
+
+
+# ---------------------------------------------------------------- confidence mask and sample selection
+
+
+def rtc_like(d, mask_end):
+    """Linear RTC-style weights for start d: 1 before d, decaying to 0 at mask_end (enough for these tests)."""
+    idx = jnp.arange(H)
+    w = jnp.clip((mask_end[..., None] - idx) / (mask_end[..., None] - d + 1), 0, 1)
+    return jnp.where(idx < d, 1.0, jnp.where(idx < mask_end[..., None], w, 0.0))
+
+
+def test_mask_weights():
+    d = 2
+    end = jnp.array([[6, 4]])
+    rtc_w = rtc_like(d, end)
+    disp = jnp.tile(jnp.linspace(0.0, 0.7, H), (1, 2, 1))
+    cfg = lambda mode, sigma: budget.LoopConfig(d=d, guidance=True, mask_mode=mode, conf_sigma=sigma,  # noqa: E731
+                                                conf_ref=0.1, n_samples=2)
+    # rtc ignores the dispersion; infinite sigma reduces both confidence modes to RTC / the RTC window
+    np.testing.assert_array_equal(budget.mask_weights(cfg("rtc", 1.0), rtc_w, disp, end), rtc_w)
+    np.testing.assert_allclose(budget.mask_weights(cfg("rtc_x_conf", float("inf")), rtc_w, disp, end), rtc_w)
+    window = np.asarray(budget.mask_weights(cfg("conf", float("inf")), rtc_w, disp, end))
+    np.testing.assert_array_equal(window[0, 0], [1, 1, 1, 1, 1, 1, 0, 0])
+    np.testing.assert_array_equal(window[0, 1], [1, 1, 1, 1, 0, 0, 0, 0])
+    # finite sigma: frozen part stays, the rest is scaled by exp(-D / (sigma * ref))
+    w = np.asarray(budget.mask_weights(cfg("rtc_x_conf", 2.0), rtc_w, disp, end))
+    conf = np.exp(-np.asarray(disp) / 0.2)
+    np.testing.assert_allclose(w[..., :d], 1.0)
+    np.testing.assert_allclose(w[..., d:], np.asarray(rtc_w)[..., d:] * conf[..., d:], rtol=1e-6)
+    pure = np.asarray(budget.mask_weights(cfg("conf", 2.0), rtc_w, disp, end))
+    np.testing.assert_allclose(pure[0, 0, d:6], conf[0, 0, d:6], rtol=1e-6)
+    assert (pure[0, 0, 6:] == 0).all() and (pure[0, 1, 4:] == 0).all()
+
+
+def test_select_index_and_take():
+    rng = np.random.default_rng(0)
+    leftover = jnp.asarray(rng.normal(size=(1, 2, H, 3)), jnp.float32)
+    samples = jnp.asarray(rng.normal(size=(8, 1, 2, H, 3)) * 3, jnp.float32)
+    samples = samples.at[5, 0, 0].set(leftover[0, 0] + 0.01).at[2, 0, 1].set(leftover[0, 1] - 0.01)
+    weights = jnp.ones((1, 2, H))
+    cfg = lambda sel: budget.LoopConfig(select=sel, n_samples=8)  # noqa: E731
+    np.testing.assert_array_equal(budget.select_index(cfg("first"), samples, leftover, weights), [[0, 0]])
+    np.testing.assert_array_equal(budget.select_index(cfg("coherent"), samples, leftover, weights), [[5, 2]])
+    # weights restrict the comparison: only index 7 counts, where sample 1 matches
+    w7 = jnp.zeros((1, 2, H)).at[..., 7].set(1.0)
+    samples2 = samples.at[1, 0, 0, 7].set(leftover[0, 0, 7])
+    assert int(budget.select_index(cfg("coherent"), samples2, leftover, w7)[0, 0]) == 1
+    # medoid: seven samples on a circle and sample 3 at its centre
+    angles = np.linspace(0, 2 * np.pi, 7, endpoint=False)
+    xy = np.insert(np.stack([np.cos(angles), np.sin(angles)], 1), 3, [0.0, 0.0], axis=0)  # (8, 2)
+    centre = jnp.zeros((8, 1, 2, H, 3)).at[..., :2].set(jnp.asarray(xy, jnp.float32)[:, None, None, None, :])
+    np.testing.assert_array_equal(budget.select_index(cfg("medoid"), centre, leftover, weights), [[3, 3]])
+    np.testing.assert_array_equal(budget.take_sample(samples, jnp.array([[5, 2]]))[0, 0], samples[5, 0, 0])
+    np.testing.assert_array_equal(budget.take_sample(samples, jnp.array([[5, 2]]))[0, 1], samples[2, 0, 1])
+
+
+def weighted_fns():
+    """Fake env whose guided chunk depends on the noise and the weights, so mask and selection change the actions."""
+    obs0, state0, step_fn, _, _, _ = fake_fns(noisy=False)
+
+    def sample_fn(obs, noise):
+        return 100 * obs[..., None] + jnp.arange(H)[None, None, :, None] + 0.3 * noise
+
+    def guided_fn(obs, noise, prev, weights):
+        return sample_fn(obs, noise) + 0.01 * weights[..., None]
+
+    return obs0, state0, step_fn, sample_fn, guided_fn, lambda end: rtc_like(2, end)
+
+
+def run(cfg, num_steps=30):
+    obs0, state0, step_fn, sample_fn, guided_fn, weights_fn = weighted_fns()
+    return budget.run_loop(cfg, H, 1, num_steps, obs0, state0, step_fn, sample_fn, guided_fn, weights_fn,
+                           jax.random.key(0), n_log=B)
+
+
+def test_conf_infinite_sigma_is_rtc():
+    base = dict(d=2, s=2, guidance=True, n_samples=4)
+    out_rtc, logs_rtc = run(budget.LoopConfig(**base))
+    out_inf, logs_inf = run(budget.LoopConfig(**base, mask_mode="rtc_x_conf", conf_sigma=float("inf")))
+    np.testing.assert_allclose(logs_inf["action"], logs_rtc["action"])
+    out_fin, logs_fin = run(budget.LoopConfig(**base, mask_mode="rtc_x_conf", conf_sigma=1.0, conf_ref=0.3))
+    assert not np.allclose(logs_fin["action"], logs_rtc["action"])  # the mask now depends on the old dispersion
+    np.testing.assert_array_equal(out_rtc["frac_sel"], 0)
+
+
+@pytest.mark.parametrize("select", ["coherent", "medoid"])
+def test_selection_in_loop(select):
+    out, logs = run(budget.LoopConfig(d=2, s=2, guidance=True, n_samples=8, select=select))
+    sel = np.asarray(logs["sel"])[np.asarray(logs["due"])]
+    assert sel.min() >= 0 and sel.max() < 8
+    assert 0 < float(np.mean(out["frac_sel"])) <= 1  # other samples than 0 do get executed
+    # first sample, same noise: identical to plain RTC
+    out_first, logs_first = run(budget.LoopConfig(d=2, s=2, guidance=True, n_samples=8))
+    out_plain, logs_plain = run(budget.LoopConfig(d=2, s=2, guidance=True))
+    np.testing.assert_allclose(logs_first["action"], logs_plain["action"])

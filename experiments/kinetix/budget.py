@@ -36,6 +36,8 @@ import jax.numpy as jnp
 PLANNERS = ("fixed", "budget", "adaptive")
 RULES = ("full", "const", "above", "aac")
 LAM_MODES = ("const", "z")
+MASK_MODES = ("rtc", "rtc_x_conf", "conf")
+SELECTS = ("first", "coherent", "medoid")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,22 +64,38 @@ class LoopConfig:
     max_guidance_weight: float = 5.0  # RTC beta, as eval_flow
     schedule: str = "exp"  # RTC soft mask, as eval_flow
     num_flow_steps: int = 5
+    # soft mask from the confidence of the old plan: c_i = exp(-D_i / (conf_sigma * conf_ref)), D_i = dispersion of
+    # the previous chunk at leftover index i (unguided samples). rtc: RTC weights; rtc_x_conf: RTC weights * c_i;
+    # conf: c_i inside the RTC window [d, mask_end). The first d (frozen) weights stay 1.
+    mask_mode: str = "rtc"
+    conf_sigma: float = float("inf")  # in units of conf_ref; inf gives c_i = 1
+    conf_ref: float = 1.0  # dispersion scale, e.g. the median dispersion of a reference run (--calibrate)
+    # executed sample: first (noise 0), coherent (closest to the old leftover under the mask, as BID's backward
+    # loss), medoid (closest to the other samples). With guidance the chosen noise is then generated with RTC.
+    select: str = "first"
 
     def validate(self, horizon: int) -> None:
         if self.planner not in PLANNERS or self.rule not in RULES or self.lam_mode not in LAM_MODES:
             raise ValueError(f"bad planner/rule/lam_mode in {self}")
+        if self.mask_mode not in MASK_MODES or self.select not in SELECTS:
+            raise ValueError(f"bad mask_mode/select in {self}")
+        if self.mask_mode != "rtc" and not self.guidance:
+            raise ValueError("mask_mode other than rtc needs guidance")
+        if not self.conf_sigma > 0 or not self.conf_ref > 0:
+            raise ValueError("conf_sigma and conf_ref must be > 0")
         if not 0 <= self.d < horizon:
             raise ValueError(f"need 0 <= d < H, got d={self.d}, H={horizon}")
         if self.planner == "fixed" and not max(self.d, 1) <= self.s <= horizon - self.d:
             raise ValueError(f"fixed planner needs max(d, 1) <= s <= H - d, got s={self.s}, d={self.d}")
         if self.needs_signal and self.n_samples < 2:
-            raise ValueError("rules 'above', 'aac' and lam_mode 'z' need n_samples >= 2")
+            raise ValueError("rules 'above', 'aac', lam_mode 'z', mask_mode != rtc and select != first need n_samples >= 2")
         if not 0.0 <= self.lam <= 1.0:
             raise ValueError("lam must be in [0, 1]")
 
     @property
     def needs_signal(self) -> bool:
-        return self.rule in ("above", "aac") or self.lam_mode == "z"
+        return (self.rule in ("above", "aac") or self.lam_mode == "z" or self.mask_mode != "rtc"
+                or self.select != "first")
 
 
 # ---------------------------------------------------------------- plans (elementwise over any batch shape)
@@ -162,6 +180,42 @@ def dispersion(samples: jax.Array) -> jax.Array:
     return samples.std(axis=0, ddof=1).mean(-1)
 
 
+def mask_weights(cfg: LoopConfig, rtc_w: jax.Array, leftover_disp: jax.Array, mask_end: jax.Array) -> jax.Array:
+    """RTC weights (L, B, H) for start d and end mask_end -> weights of cfg.mask_mode.
+
+    leftover_disp (L, B, H): dispersion of the previous chunk aligned with its leftover.
+    """
+    if cfg.mask_mode == "rtc":
+        return rtc_w
+    idx = jnp.arange(rtc_w.shape[-1])
+    conf = jnp.exp(-leftover_disp / (cfg.conf_sigma * cfg.conf_ref))
+    frozen = idx < cfg.d
+    if cfg.mask_mode == "rtc_x_conf":
+        return jnp.where(frozen, rtc_w, rtc_w * conf)
+    window = idx < mask_end[..., None]
+    return jnp.where(frozen, 1.0, jnp.where(window, conf, 0.0))
+
+
+def select_index(cfg: LoopConfig, samples: jax.Array, leftover: jax.Array, weights: jax.Array) -> jax.Array:
+    """samples (K, L, B, H, A) -> (L, B) index of the sample to execute."""
+    lead = samples.shape[1:3]
+    if cfg.select == "first":
+        return jnp.zeros(lead, jnp.int32)
+    if cfg.select == "coherent":  # BID backward loss: weighted L2 distance to the old leftover
+        err = jnp.linalg.norm(samples - leftover[None], axis=-1)  # (K, L, B, H)
+        score = (err * weights[None]).sum(-1)
+    else:  # medoid: mean distance to the other samples
+        err = jnp.linalg.norm(samples[:, None] - samples[None], axis=-1).mean(-1)  # (K, K, L, B)
+        score = err.sum(1)
+    return jnp.argmin(score, axis=0).astype(jnp.int32)
+
+
+def take_sample(stack: jax.Array, k: jax.Array) -> jax.Array:
+    """stack (K, L, B, ...), k (L, B) -> (L, B, ...)."""
+    idx = k.reshape((1, *k.shape) + (1,) * (stack.ndim - 3))
+    return jnp.take_along_axis(stack, idx, axis=0)[0]
+
+
 # step_fn(t, env_state, action (L,B,A)) -> (obs, env_state, done (L,B), info with returned_episode_{solved,returns,lengths})
 # sample_fn(obs, noise (L,B,H,A)) -> chunk; guided_fn(obs, noise, leftover, weights (L,B,H)) -> chunk
 # weights_fn(mask_end (L,B)) -> (L,B,H) RTC weights for start d
@@ -185,27 +239,32 @@ def run_loop(
     def noise(t, k):
         return jax.random.normal(jax.random.fold_in(jax.random.fold_in(noise_key, t), k), (*lead, horizon, action_dim))
 
-    def infer(t, obs, leftover, mask_end, first: bool):
-        noises = [noise(t, k) for k in range(n_k)]
+    def infer(t, obs, leftover, leftover_disp, mask_end, first: bool):
+        noises = jnp.stack([noise(t, k) for k in range(n_k)])
         need_samples = n_k > 1 or not cfg.guidance or first
         samples = jnp.stack([sample_fn(obs, z) for z in noises]) if need_samples else None
         disp = dispersion(samples) if n_k > 1 else jnp.zeros((*lead, horizon))
-        if cfg.guidance and not first:
-            chunk = guided_fn(obs, noises[0], leftover, weights_fn(mask_end))
+        if first:  # nothing to be coherent with
+            return (samples[0], disp, jnp.zeros(lead, jnp.int32), *plan(cfg, disp))
+        weights = mask_weights(cfg, weights_fn(mask_end), leftover_disp, mask_end)
+        k = select_index(cfg, samples, leftover, weights) if n_k > 1 else jnp.zeros(lead, jnp.int32)
+        if cfg.guidance:
+            chunk = guided_fn(obs, take_sample(noises, k), leftover, weights)
         else:
-            chunk = samples[0]
-        return (chunk, disp, *plan(cfg, disp))
+            chunk = take_sample(samples, k)
+        return (chunk, disp, k, *plan(cfg, disp))
 
     # first chunk, synchronous; inference also starts at t = 0 with the plan of this chunk
-    chunk0, disp0, _, end0, h0, lam0 = infer(num_steps, obs0, None, None, first=True)
+    chunk0, disp0, _, _, end0, h0, lam0 = infer(num_steps, obs0, None, None, None, first=True)
     zl = jnp.zeros(lead, jnp.int32)
     zf = jnp.zeros(lead, jnp.float32)
     carry0 = dict(
         obs=obs0, env_state=env_state0,
         active=chunk0, active_start=zl, pending=jnp.zeros_like(chunk0), pend_start=zl, pend_switch=zl - 1,
+        active_disp=disp0, pending_disp=jnp.zeros_like(disp0),
         next_start=zl, next_mask=end0,
         alive=jnp.ones(lead, bool), solved=zf, ret=zf, length=zl,
-        n_infer=zl + 1, sum_s=zl, sum_h=h0, sum_mask=end0, sum_lam=lam0,
+        n_infer=zl + 1, sum_s=zl, sum_h=h0, sum_mask=end0, sum_lam=lam0, n_sel=zl,
         prev_action=jnp.zeros((*lead, action_dim)),
         jump_sw=zf, n_sw=zl, jump_other=zf, n_other=zl,
     )
@@ -214,6 +273,7 @@ def run_loop(
         act = c["pend_switch"] == t
         c = dict(c)
         c["active"] = jnp.where(act[..., None, None], c["pending"], c["active"])
+        c["active_disp"] = jnp.where(act[..., None], c["pending_disp"], c["active_disp"])
         c["active_start"] = jnp.where(act, c["pend_start"], c["active_start"])
         c["pend_switch"] = jnp.where(act, -1, c["pend_switch"])
         return c, act
@@ -221,8 +281,10 @@ def run_loop(
     def body(c, t):
         c, switched = activate(c, t)  # a chunk started d steps ago takes over before the next inference
         due = c["next_start"] == t
-        leftover = shift(c["active"], t - c["active_start"])
-        args = (t, c["obs"], leftover, c["next_mask"])
+        off = t - c["active_start"]
+        leftover = shift(c["active"], off)
+        leftover_disp = shift(c["active_disp"][..., None], off)[..., 0]
+        args = (t, c["obs"], leftover, leftover_disp, c["next_mask"])
         out_shape = jax.eval_shape(lambda *a: infer(*a, first=False), *args)
         new = jax.lax.cond(
             due.any(),
@@ -230,9 +292,11 @@ def run_loop(
             lambda a: jax.tree.map(lambda s: jnp.zeros(s.shape, s.dtype), out_shape),
             args,
         )
-        chunk, disp, s, end, h, lam = new
+        chunk, disp, sel, s, end, h, lam = new
         counted = due & c["alive"]
         c["pending"] = jnp.where(due[..., None, None], chunk, c["pending"])
+        c["pending_disp"] = jnp.where(due[..., None], disp, c["pending_disp"])
+        c["n_sel"] += counted & (sel != 0)
         c["pend_start"] = jnp.where(due, t, c["pend_start"])
         c["pend_switch"] = jnp.where(due, t + d, c["pend_switch"])
         c["next_start"] = jnp.where(due, t + s, c["next_start"])
@@ -265,7 +329,8 @@ def run_loop(
             c[key] = jnp.where(first_done, value, c[key])
         c["alive"] = c["alive"] & ~done
         c["obs"], c["env_state"] = obs, env_state
-        log = dict(disp=disp[:, :n_log], due=counted[:, :n_log], action=action[:, :n_log])
+        log = dict(disp=disp[:, :n_log], due=counted[:, :n_log], action=action[:, :n_log], sel=sel[:, :n_log],
+                   end=end[:, :n_log])
         return c, log
 
     c, logs = jax.lax.scan(body, carry0, jnp.arange(num_steps))
@@ -273,7 +338,7 @@ def run_loop(
     out = dict(
         solved=c["solved"], ret=c["ret"], length=c["length"], unfinished=c["alive"],
         n_infer=c["n_infer"],
-        mean_s=c["sum_s"] / n,
+        mean_s=c["sum_s"] / n, frac_sel=c["n_sel"] / n,  # share of chunks where a sample other than 0 was executed
         mean_h=c["sum_h"] / c["n_infer"], mean_mask=c["sum_mask"] / c["n_infer"], mean_lam=c["sum_lam"] / c["n_infer"],
         jump_switch=c["jump_sw"] / jnp.maximum(c["n_sw"], 1), jump_other=c["jump_other"] / jnp.maximum(c["n_other"], 1),
     )
