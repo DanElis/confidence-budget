@@ -11,6 +11,14 @@ Planners (see planner.py):
     --planner budget --hstar-config F --lam 0.5    confidence budget with fixed lambda
     --planner budget --hstar-config F --lam entropy --lam-config F   lambda from entropy
 
+K noise samples per inference (--n-samples K > 1, see selection.py): K unguided samples give the dispersion,
+the agreement of the old plan with the new samples and the choice of the executed sample; with guidance the
+chosen noise is then generated once more with RTC.
+    --select coherent|medoid                       executed sample (default first = noise 0)
+    --mask-mode rtc_x_conf|conf --conf-sigma S --conf-ref R   RTC mask weighted by exp(-D_old / (S * R))
+    --signal agreement --planner adaptive|budget --hstar-rule kind=above,eta=Z,k=1,min_h=1
+                                                   h* = first index where the old plan leaves the new samples' cloud
+
 Suites: stock LIBERO names (``libero_object``) and LIBERO-PRO position levels
 (``pos:x0.2``, ``pos:y0.1``, ``pos:all``). Results go to ``--out`` as one JSON
 per suite (re-running skips finished suites) plus ``summary.md``.
@@ -46,9 +54,19 @@ from libero_pro_suites import (  # noqa: E402
     suite_name,
 )
 from planner import AdaptivePlanner, BudgetPlanner, EntropyLambda, FixedPlanner  # noqa: E402
+from selection import (  # noqa: E402
+    MASK_MODES,
+    SELECTS,
+    agreement,
+    conf_weights,
+    dispersion,
+    expand_noise,
+    select_index,
+)
 
 log = logging.getLogger("eval_libero")
 CONTROL_HZ = 20.0  # LIBERO / robosuite control frequency
+ACTION_DIM = 7  # LIBERO: 6-DoF end-effector delta + gripper; the policy pads to max_action_dim
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -75,6 +93,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--lam", default="0.5", help="budget: lambda in [0, 1], or 'entropy'")
     p.add_argument("--lam-config", type=Path, default=None, help="budget, --lam entropy: JSON with mu, sigma, zone, z_max")
     p.add_argument("--r-min", type=int, default=5)
+    p.add_argument("--s-min", type=int, default=5, help="adaptive: lower bound of s")
+    p.add_argument("--s-max", type=int, default=None, help="adaptive: upper bound of s (default H - d)")
+    p.add_argument("--mask-r", type=int, default=None, help="adaptive: mask end d + r (default H - s)")
+    # K samples
+    p.add_argument("--n-samples", type=int, default=1, help="K noise samples per inference")
+    p.add_argument("--select", choices=SELECTS, default="first")
+    p.add_argument("--mask-mode", choices=MASK_MODES, default="rtc")
+    p.add_argument("--conf-sigma", type=float, default=1.0, help="confidence mask scale, in units of --conf-ref")
+    p.add_argument("--conf-ref", type=float, default=1.0, help="dispersion scale (median dispersion of a reference run)")
+    p.add_argument("--signal", choices=["entropy", "agreement"], default="entropy",
+                   help="what the budget / adaptive planner's h* rule reads (agreement needs --n-samples > 1)")
     # outputs
     p.add_argument("--record-entropy", action="store_true", help="store cross-attention entropy of every chunk")
     p.add_argument("--save-actions", action="store_true", help="store executed actions (.npy)")
@@ -121,7 +150,8 @@ def make_planner(args, horizon: int):
     else:
         raise SystemExit(f"--planner {args.planner} needs --hstar-config or --hstar-rule")
     if args.planner == "adaptive":
-        return AdaptivePlanner(horizon, rule, s_min=getattr(args, "s_min", 5))
+        return AdaptivePlanner(horizon, rule, s_min=getattr(args, "s_min", 5), s_max=getattr(args, "s_max", None),
+                               mask_r=getattr(args, "mask_r", None))
     if args.lam == "entropy":
         if args.lam_config is None:
             raise SystemExit("--lam entropy needs --lam-config")
@@ -130,6 +160,20 @@ def make_planner(args, horizon: int):
         lam_fn = EntropyLambda(**{k: cfg[k] for k in ("mu", "sigma", "zone", "z_max") if k in cfg})
         return BudgetPlanner(horizon, rule, r_min=args.r_min, lam=None, lam_fn=lam_fn)
     return BudgetPlanner(horizon, rule, r_min=args.r_min, lam=float(args.lam))
+
+
+def check_sample_args(args) -> None:
+    k = args.n_samples
+    if k < 1:
+        raise SystemExit("--n-samples must be >= 1")
+    if k == 1 and (args.select != "first" or args.mask_mode != "rtc" or args.signal == "agreement"):
+        raise SystemExit("--select, --mask-mode and --signal agreement need --n-samples > 1")
+    if k > 1 and args.record_entropy:
+        raise SystemExit("--record-entropy is not supported with --n-samples > 1")
+    if k > 1 and args.planner != "fixed" and args.signal != "agreement":
+        raise SystemExit("with --n-samples > 1 the budget / adaptive planner needs --signal agreement")
+    if args.mask_mode != "rtc" and args.guidance == "none":
+        raise SystemExit("--mask-mode needs guidance")
 
 
 def load_policy(path: str, device: str):
@@ -150,10 +194,11 @@ def episode_sparc(actions: np.ndarray) -> float:
 
 def main() -> None:
     args = parse_args()
+    check_sample_args(args)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
     import_libero_quietly()
     from h1.attention import CrossAttentionRecorder
-    from h1.guidance import install_batch_rtc, make_rtc_config
+    from h1.guidance import BatchRTCProcessor, install_batch_rtc, make_rtc_config
     from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
     from lerobot.envs.libero import LiberoEnv
     from lerobot.envs.utils import parse_camera_names, preprocess_observation
@@ -169,10 +214,11 @@ def main() -> None:
     planner = make_planner(args, horizon)
     max_steps = args.max_steps or MAX_STEPS
     cfg = LoopConfig(horizon, args.delay, args.guidance != "none", max_steps, args.seed)
-    if args.guidance != "none":
-        default_end = horizon - (args.stride or 10)
-        install_batch_rtc(policy, args.guidance, make_rtc_config(args.schedule, args.max_guidance_weight, default_end))
-    need_entropy = args.record_entropy or planner.needs_entropy
+    default_end = horizon - (args.stride or 10)
+    rtc_config = make_rtc_config(args.schedule, args.max_guidance_weight, default_end)
+    rtc_proc = install_batch_rtc(policy, args.guidance, rtc_config) if args.guidance != "none" else None
+    weights_proc = BatchRTCProcessor(rtc_config, jacobian=False)  # RTC mask for scoring samples, also without guidance
+    need_entropy = args.record_entropy or (planner.needs_entropy and args.signal == "entropy")
     recorder = CrossAttentionRecorder(policy.model).attach() if need_entropy else None
 
     preprocessor, postprocessor = make_pre_post_processors(
@@ -185,11 +231,57 @@ def main() -> None:
     noise_shape = (horizon, int(policy.config.max_action_dim))
     log.info("H=%d d=%d guidance=%s planner=%s max_steps=%d", horizon, args.delay, args.guidance, planner, max_steps)
 
+    def to_batch(observations, task_description: str):
+        obs = preprocess_observation(stack_observations(observations))
+        obs["task"] = [task_description] * len(observations)
+        return preprocessor(env_pre(obs))
+
+    def infer_samples(observations, noise, leftover, delay, mask_end, leftover_disp, leftover_len,
+                      task_description: str) -> Chunk:
+        """K unguided samples -> dispersion, agreement, choice; with guidance the chosen noise is generated with RTC."""
+        n, k, dev = len(observations), args.n_samples, args.device
+        noise_k = expand_noise(noise, k)  # (n*K, H, A_max), row i*K is the episode's noise
+        with torch.no_grad():  # no leftover: the RTC processor leaves these unguided
+            samples = policy.predict_action_chunk(to_batch([o for o in observations for _ in range(k)],
+                                                           task_description), noise=noise_k.to(dev))
+        samples = samples.float().reshape(n, k, horizon, -1)
+        real = samples[..., :ACTION_DIM]
+        disp = dispersion(real)
+        sel, z = torch.zeros(n, dtype=torch.long), torch.zeros(n, horizon)
+        if leftover is None:  # first chunk of the episode
+            model = samples[:, 0]
+        else:
+            left = leftover[..., :ACTION_DIM].to(dev)
+            rtc_w = weights_proc.prefix_weights(delay, mask_end, n, horizon, horizon).to(dev)
+            w = conf_weights(args.mask_mode, rtc_w, None if leftover_disp is None else leftover_disp.to(dev),
+                             delay, mask_end, args.conf_sigma * args.conf_ref)
+            sel = select_index(args.select, real, left, w)
+            z = agreement(real, left, leftover_len)
+            if args.guidance != "none":
+                chosen = noise_k.view(n, k, *noise.shape[1:])[torch.arange(n), sel]
+                rtc_proc.weight_override = w
+                try:
+                    with torch.no_grad():
+                        model = policy.predict_action_chunk(
+                            to_batch(observations, task_description), noise=chosen.to(dev), inference_delay=delay,
+                            prev_chunk_left_over=leftover.to(dev), execution_horizon=mask_end)
+                finally:
+                    rtc_proc.weight_override = None
+            else:
+                model = samples[torch.arange(n, device=samples.device), sel.to(samples.device)]
+        model = model.float()
+        actions = env_post({ACTION: postprocessor(model.clone())})[ACTION]
+        disp_np, z_np = disp.cpu().numpy(), z.numpy()
+        return Chunk(model, torch.as_tensor(actions).float().cpu().numpy(),
+                     signal=z_np if args.signal == "agreement" else None, dispersion=disp_np,
+                     extras={"dispersion": disp_np, "agree": z_np, "sel": sel.numpy()})
+
     def make_infer(task_description: str):
-        def infer(observations, noise, leftover, delay, mask_end) -> Chunk:
-            obs = preprocess_observation(stack_observations(observations))
-            obs["task"] = [task_description] * len(observations)
-            batch = preprocessor(env_pre(obs))
+        def infer(observations, noise, leftover, delay, mask_end, leftover_disp=None, leftover_len=None) -> Chunk:
+            if args.n_samples > 1:
+                return infer_samples(observations, noise, leftover, delay, mask_end, leftover_disp, leftover_len,
+                                     task_description)
+            batch = to_batch(observations, task_description)
             kwargs = {}
             if leftover is not None:
                 kwargs = {"inference_delay": delay, "prev_chunk_left_over": leftover.to(args.device),
@@ -230,7 +322,8 @@ def main() -> None:
                 policy.reset()
                 global_ids = [tid * 1000 + i for i in ids]  # noise depends on task and init state only
                 try:
-                    res = run_batch(envs, infer, cfg, planner, global_ids, noise_shape, keep_entropy=args.record_entropy)
+                    res = run_batch(envs, infer, cfg, planner, global_ids, noise_shape,
+                                    keep_entropy=args.record_entropy or args.n_samples > 1)
                 finally:
                     for env in envs:
                         env.close()
@@ -238,12 +331,14 @@ def main() -> None:
                 for b, i in enumerate(ids):
                     strides = [c["stride"] for c in res.chunks if c["env"] == b]
                     hs = [c["h_star"] for c in res.chunks if c["env"] == b and c["h_star"] is not None]
+                    sels = [c["sel"] != 0 for c in res.chunks if c["env"] == b and "sel" in c and c["step"] > 0]
                     episodes.append({
                         "task_id": tid, "init_state": i, "success": bool(res.success[b]),
                         "length": int(res.length[b]), "n_inference": int(res.n_inference[b]),
                         "sparc": episode_sparc(res.actions[b]),
                         "mean_stride": float(np.mean(strides)) if strides else None,
                         "mean_h_star": float(np.mean(hs)) if hs else None,
+                        "frac_sel": float(np.mean(sels)) if sels else None,
                     })
                 batches.append({"task_id": tid, "init_states": ids, "jump_at_switch": jump_switch,
                                 "jump_other": jump_other})

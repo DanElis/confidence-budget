@@ -126,6 +126,9 @@ class BatchRTCProcessor(RTCProcessor):
     def __init__(self, rtc_config, jacobian: bool):
         super().__init__(rtc_config)
         self.jacobian = jacobian
+        # (B, H) weights for the next guided call instead of the RTC mask (e.g. modulated by the old plan's
+        # confidence); set by the caller right before predict_action_chunk and reset after it
+        self.weight_override: torch.Tensor | None = None
 
     def prefix_weights(self, delay, mask_end, batch: int, horizon: int, prev_len: int) -> torch.Tensor:
         delays = torch.as_tensor(delay).reshape(-1).expand(batch) if torch.as_tensor(delay).numel() == 1 \
@@ -154,7 +157,10 @@ class BatchRTCProcessor(RTCProcessor):
         steps = min(prev.shape[1], horizon)
         target = torch.zeros(batch, horizon, action_dim, device=x_t.device, dtype=x_t.dtype)
         target[:, :steps, :real_dim] = prev[:, :steps, :real_dim].to(device=x_t.device, dtype=x_t.dtype)
-        w = self.prefix_weights(inference_delay, execution_horizon, batch, horizon, prev.shape[1])
+        if self.weight_override is not None:
+            w = self.weight_override
+        else:
+            w = self.prefix_weights(inference_delay, execution_horizon, batch, horizon, prev.shape[1])
         weights = w.to(device=x_t.device, dtype=x_t.dtype)[:, :, None].expand(batch, horizon, action_dim).clone()
         if self.jacobian:
             weights[:, :, real_dim:] = 0.0

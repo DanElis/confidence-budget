@@ -53,10 +53,15 @@ class Chunk:
     signal: np.ndarray | None = None
     # name -> (B, ...) arrays stored in the chunk log when keep_entropy (e.g. "dispersion", "plan")
     extras: dict = field(default_factory=dict)
+    # (B, H) dispersion across noise samples. When an infer returns it, the loop keeps it with the chunk and passes
+    # the next infer the old plan even without guidance: leftover, mask_end, plus keyword arguments
+    # leftover_disp (B, H) (aligned with the leftover, zero-padded) and leftover_len (B,)
+    dispersion: np.ndarray | None = None
 
 
-# infer(observations, noise (B,H,A_max), leftover (B,H,A) zero-padded | None, delay, mask_end (B,) | None) -> Chunk
-Infer = Callable[[list, torch.Tensor, torch.Tensor | None, int, torch.Tensor | None], Chunk]
+# infer(observations, noise (B,H,A_max), leftover (B,H,A) zero-padded | None, delay, mask_end (B,) | None
+#       [, leftover_disp=..., leftover_len=...]) -> Chunk
+Infer = Callable[..., Chunk]
 
 
 @dataclass
@@ -108,28 +113,38 @@ def run_batch(
     active_model: list[torch.Tensor | None] = [None] * n
     active_actions: list[np.ndarray | None] = [None] * n
     active_start = np.zeros(n, dtype=np.int64)
-    pending: list[tuple | None] = [None] * n  # (model, actions, start, switch_at)
+    active_disp: list[np.ndarray | None] = [None] * n
+    pending: list[tuple | None] = [None] * n  # (model, actions, start, switch_at, dispersion)
     next_start = np.zeros(n, dtype=np.int64)
     next_mask = np.zeros(n, dtype=np.int64)
 
     def generate(t: int, due: list[int]) -> None:
         first = active_model[due[0]] is None
-        leftover, mask = None, None
-        if cfg.guidance and not first:
+        with_disp = not first and active_disp[due[0]] is not None
+        leftover, mask, extra = None, None, {}
+        if (cfg.guidance or with_disp) and not first:
             leftover = torch.zeros(len(due), horizon, active_model[due[0]].shape[-1])
             for i, b in enumerate(due):
                 rest = active_model[b][t - active_start[b] :]
                 leftover[i, : rest.shape[0]] = rest.detach().float().cpu()
             mask = torch.as_tensor(next_mask[due], dtype=torch.long)
+        if with_disp:
+            disp = torch.zeros(len(due), horizon)
+            for i, b in enumerate(due):
+                rest = active_disp[b][t - active_start[b] :]
+                disp[i, : rest.shape[0]] = torch.as_tensor(rest, dtype=torch.float32)
+            extra = {"leftover_disp": disp,
+                     "leftover_len": torch.as_tensor([horizon - (t - active_start[b]) for b in due])}
         noise = chunk_noise(cfg.seed, [episode_ids[b] for b in due], t, noise_shape)
-        chunk = infer([observations[b] for b in due], noise, leftover, 0 if first else d, mask)
+        chunk = infer([observations[b] for b in due], noise, leftover, 0 if first else d, mask, **extra)
         for i, b in enumerate(due):
             entropy = None if chunk.entropy is None else np.asarray(chunk.entropy[i])
             n_valid = None if chunk.n_valid is None else int(chunk.n_valid[i])
             signal = entropy if chunk.signal is None else np.asarray(chunk.signal[i])
             plan = planner(signal, n_valid, d)
             switch = t if first else t + d
-            pending[b] = (chunk.model[i].detach(), np.asarray(chunk.actions[i]), t, switch)
+            disp_i = None if chunk.dispersion is None else np.asarray(chunk.dispersion[i], dtype=np.float32)
+            pending[b] = (chunk.model[i].detach(), np.asarray(chunk.actions[i]), t, switch, disp_i)
             next_start[b] = t + plan.stride
             next_mask[b] = plan.mask_end
             n_inference[b] += 1
@@ -146,7 +161,7 @@ def run_batch(
     def activate(t: int) -> None:
         for b in range(n):
             if pending[b] is not None and pending[b][3] == t:
-                active_model[b], active_actions[b], active_start[b], _ = pending[b]
+                active_model[b], active_actions[b], active_start[b], _, active_disp[b] = pending[b]
                 pending[b] = None
                 switch_steps[b].append(t)
 

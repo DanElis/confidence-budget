@@ -103,13 +103,15 @@ class AdaptivePlanner:
 
     s = clip(h* - d, s_min, s_max), so that the switch to the next chunk (d steps after its
     inference started) happens no later than h*. No budget for the guided window: with guidance
-    the mask covers the rest of the leftover (H - s), as in ordinary RTC.
+    the mask covers the rest of the leftover (H - s), as in ordinary RTC, or d + mask_r if mask_r is set
+    (short window; the long one fails on LIBERO).
     """
 
     horizon: int
     rule: HStarRule
     s_min: int = 5
     s_max: int | None = None
+    mask_r: int | None = None
 
     @property
     def needs_entropy(self) -> bool:
@@ -119,7 +121,8 @@ class AdaptivePlanner:
         h = self.rule(signal, n_valid)
         s_max = self.horizon - delay if self.s_max is None else min(self.s_max, self.horizon - delay)
         s = int(min(max(h - delay, self.s_min, max(delay, 1)), s_max))
-        return Plan(stride=s, mask_end=self.horizon - s, h_star=int(h))
+        end = self.horizon - s if self.mask_r is None else min(delay + self.mask_r, self.horizon - s)
+        return Plan(stride=s, mask_end=end, h_star=int(h))
 
 
 def budget_plan(h_star: int, delay: int, r_min: int, lam: float, horizon: int, s_min: int = 1) -> Plan:
