@@ -9,6 +9,8 @@ Each --config is ``label:key=value,...`` with keys of budget.LoopConfig (d defau
     b05:guidance=1,planner=budget,rule=above,eta=0.03,k=1,min_h=1,lam=0.5,n_samples=8
     bz:guidance=1,planner=budget,rule=above,eta=0.03,lam_mode=z,mu=0.01,sigma=0.005,n_samples=8
     ada:guidance=1,planner=adaptive,rule=above,eta=0.03,n_samples=8
+    b_aac:guidance=1,planner=budget,rule=aac,min_h=1,lam=0.5,n_samples=8      h* as in AAC, no threshold to calibrate
+    ada_aac:guidance=1,planner=adaptive,rule=aac,min_h=1,n_samples=8
 
 Protocol (CLAUDE.md): environments, resets and noise are shared by all configs of a run (paired); Δ is reported
 against the first config with the same d, with a 95% bootstrap CI over environments (stratified by level).

@@ -50,6 +50,37 @@ def test_h_star_above_matches_libero(k):
         np.testing.assert_array_equal(got, ref)
 
 
+def aac_ref(x: np.ndarray, min_h: int) -> int:
+    """AAC [13] Eq. 5 written out: h* = max(argmax_h (E_{h+1} - E_h), xi), E_h = mean of x over the first h actions."""
+    horizon = len(x)
+    mean = {h: x[:h].mean() for h in range(1, horizon + 1)}
+    gains = {h: mean[h + 1] - mean[h] for h in range(1, horizon)}
+    best = max(gains, key=lambda h: (gains[h], -h))  # first h on ties, as argmax
+    return min(max(best, min_h), horizon)
+
+
+@pytest.mark.parametrize("min_h", [1, 2, 4])
+def test_h_star_aac_matches_formula(min_h):
+    rng = np.random.default_rng(min_h)
+    disp = np.concatenate([rng.uniform(0, 1, size=(200, H)), np.cumsum(rng.uniform(0, 0.1, size=(200, H)), 1)])
+    cfg = budget.LoopConfig(rule="aac", min_h=min_h, n_samples=2)
+    got = np.asarray(budget.h_star(cfg, jnp.asarray(disp)))
+    np.testing.assert_array_equal(got, [aac_ref(x, min_h) for x in disp])
+
+
+def test_h_star_aac_example():
+    cfg = budget.LoopConfig(rule="aac", min_h=1, n_samples=2)
+    # flat, then a jump at index 3: the prefix mean grows most from h = 3 to h = 4
+    assert int(budget.h_star(cfg, jnp.array([0.1, 0.1, 0.1, 1.0, 1.0, 1.0, 1.0, 1.0]))) == 3
+    # lower bound wins over an early jump
+    cfg2 = budget.LoopConfig(rule="aac", min_h=5, n_samples=2)
+    assert int(budget.h_star(cfg2, jnp.array([0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]))) == 5
+    # constant dispersion: all gains 0, first h
+    assert int(budget.h_star(cfg, jnp.full(H, 0.25))) == 1  # exact in float32, so the gains are exactly 0
+    with pytest.raises(ValueError):
+        budget.LoopConfig(rule="aac", n_samples=1).validate(H)
+
+
 def test_shift():
     chunk = jnp.arange(2 * H, dtype=jnp.float32).reshape(1, 2, H, 1)
     out = budget.shift(chunk, jnp.array([[0, 3]]))
@@ -142,3 +173,25 @@ def test_budget_schedule(d, r_min, lam):
     steps = np.flatnonzero(due)
     assert [t for t, _ in plans] == steps.tolist()
     np.testing.assert_array_equal(np.asarray(budget.h_star(cfg, jnp.asarray(disp[steps]))), j_of(steps))
+
+
+@pytest.mark.parametrize("planner,d,lam", [("budget", 1, 0.5), ("budget", 2, 1.0), ("adaptive", 1, 0.5)])
+def test_aac_schedule(planner, d, lam):
+    """Plans from the aac rule; noise differs per env, so each env gets its own schedule from its own dispersion."""
+    num_steps = 60
+    obs0, state0, step_fn, sample_fn, guided_fn, weights_fn = fake_fns(noisy=True)
+    cfg = budget.LoopConfig(d=d, guidance=True, planner=planner, rule="aac", min_h=1, lam=lam, n_samples=8)
+    out, logs = budget.run_loop(cfg, H, 1, num_steps, obs0, state0, step_fn, sample_fn, guided_fn, weights_fn,
+                                jax.random.key(0), n_log=B)
+    got = np.round(np.asarray(logs["action"])[:, 0, :, 0])
+    disp = np.asarray(logs["disp"])[:, 0]  # (T, B, H)
+    for b in range(B):
+        def stride_at(t):
+            h = aac_ref(disp[t, b].astype(np.float64), cfg.min_h)
+            if planner == "budget":
+                return lp_planner.budget_plan(h, d, cfg.r_min, lam, H).stride
+            return lp_planner.AdaptivePlanner(H, lp_hstar.HStarRule("const", c=h), s_min=1)(np.zeros(H), 0, d).stride
+
+        want, plans = reference(d, num_steps, stride_at)
+        np.testing.assert_array_equal(got[:, b], want)
+        assert np.flatnonzero(np.asarray(logs["due"])[:, 0, b]).tolist() == [t for t, _ in plans]

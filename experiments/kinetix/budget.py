@@ -15,7 +15,10 @@ Planners (``LoopConfig.planner``):
 * ``adaptive`` - s = clip(h* - d, max(s_min, d, 1), H - d), mask to H - s (AAC-style, no budget for the mask).
 
 h* (``rule``): ``full`` (H), ``const`` (c), ``above`` (first index where the smoothed dispersion across K noise
-samples reaches eta, at least min_h; as hstar.py). lam (``lam_mode``): ``const`` or ``z`` (from the z-score of the
+samples reaches eta, at least min_h; as hstar.py), ``aac`` (no threshold: AAC [13], Eq. 5, with the dispersion in
+place of the action entropy: h* = max(argmax_h (D_{h+1} - D_h), min_h), D_h = mean dispersion over the first h
+actions; AAC's lower bound from the motion magnitude has no analogue for Kinetix motor commands, so it is the
+constant min_h). lam (``lam_mode``): ``const`` or ``z`` (from the z-score of the
 mean dispersion over the first ``zone`` actions, as planner.EntropyLambda).
 
 The step loop is a ``lax.scan`` over control steps; the policy runs under ``lax.cond`` only at steps where some
@@ -31,7 +34,7 @@ import jax
 import jax.numpy as jnp
 
 PLANNERS = ("fixed", "budget", "adaptive")
-RULES = ("full", "const", "above")
+RULES = ("full", "const", "above", "aac")
 LAM_MODES = ("const", "z")
 
 
@@ -46,7 +49,7 @@ class LoopConfig:
     eta: float = 0.0  # above: dispersion threshold
     c: int = 8  # const: h*
     k: int = 1  # above: smoothing window
-    min_h: int = 1  # above: lower bound of h*
+    min_h: int = 1  # above, aac: lower bound of h*
     lam: float = 0.5  # lam_mode const
     lam_mode: str = "const"
     mu: float = 0.0  # lam_mode z: mean / std of the early-zone dispersion (from calibration)
@@ -68,13 +71,13 @@ class LoopConfig:
         if self.planner == "fixed" and not max(self.d, 1) <= self.s <= horizon - self.d:
             raise ValueError(f"fixed planner needs max(d, 1) <= s <= H - d, got s={self.s}, d={self.d}")
         if self.needs_signal and self.n_samples < 2:
-            raise ValueError("rule 'above' and lam_mode 'z' need n_samples >= 2")
+            raise ValueError("rules 'above', 'aac' and lam_mode 'z' need n_samples >= 2")
         if not 0.0 <= self.lam <= 1.0:
             raise ValueError("lam must be in [0, 1]")
 
     @property
     def needs_signal(self) -> bool:
-        return self.rule == "above" or self.lam_mode == "z"
+        return self.rule in ("above", "aac") or self.lam_mode == "z"
 
 
 # ---------------------------------------------------------------- plans (elementwise over any batch shape)
@@ -99,7 +102,11 @@ def h_star(cfg: LoopConfig, disp: jax.Array) -> jax.Array:
         return jnp.full(shape, horizon, jnp.int32)
     if cfg.rule == "const":
         return jnp.full(shape, min(max(cfg.c, 1), horizon), jnp.int32)
-    hits = smooth(disp, cfg.k) >= cfg.eta
+    if cfg.rule == "aac":
+        prefix_mean = jnp.cumsum(disp, axis=-1) / jnp.arange(1, horizon + 1)  # D_h, h = 1..H
+        h = jnp.argmax(jnp.diff(prefix_mean, axis=-1), axis=-1) + 1  # diff index j is D_{j+2} - D_{j+1}
+        return jnp.clip(jnp.maximum(h, cfg.min_h), 1, horizon).astype(jnp.int32)
+    hits =smooth(disp, cfg.k) >= cfg.eta
     j = jnp.where(hits.any(-1), jnp.argmax(hits, axis=-1), horizon)
     return jnp.clip(jnp.maximum(j, cfg.min_h), 1, horizon).astype(jnp.int32)
 
