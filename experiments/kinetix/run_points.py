@@ -60,8 +60,8 @@ def level_name(path: str) -> str:
     return path.replace("/", "_").replace(".json", "")
 
 
-def build(run_path: pathlib.Path, level_paths, step: int):
-    """Copy of the setup part of eval_flow.main."""
+def load(run_path: pathlib.Path, level_paths, step: int):
+    """Copy of the setup part of eval_flow.main: levels, env, stacked policy state dicts, dims."""
     static_env_params = kenv_state.StaticEnvParams(**train_expert.LARGE_ENV_PARAMS, frame_skip=train_expert.FRAME_SKIP)
     env_params = kenv_state.EnvParams()
     levels = train_expert.load_levels(level_paths, static_env_params, env_params)
@@ -80,8 +80,14 @@ def build(run_path: pathlib.Path, level_paths, step: int):
         0
     ].shape[-1]
     action_dim = env.action_space(env_params).shape[0]
+    return env, env_params, static_env_params, levels, state_dicts, ckpt_dir, obs_dim, action_dim
 
-    mesh = jax.make_mesh((jax.local_device_count(),), ("x",))
+
+def build(run_path: pathlib.Path, level_paths, step: int):
+    env, env_params, static_env_params, levels, state_dicts, ckpt_dir, obs_dim, action_dim = load(
+        run_path, level_paths, step
+    )
+    mesh =jax.make_mesh((jax.local_device_count(),), ("x",))
     pspec = jax.sharding.PartitionSpec("x")
     sharding = jax.sharding.NamedSharding(mesh, pspec)
 

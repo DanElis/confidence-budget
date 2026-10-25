@@ -1,0 +1,144 @@
+"""budget.py against libero_pro (planner.py, hstar.py) and a reference schedule with closed_loop.py semantics.
+
+    uv run --project third_party/real-time-chunking-kinetix --with pytest python -m pytest -q tests
+"""
+
+import itertools
+import pathlib
+import sys
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+HERE = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / "libero_pro"))
+
+import budget  # noqa: E402
+import hstar as lp_hstar  # noqa: E402
+import planner as lp_planner  # noqa: E402
+
+H = 8
+
+
+def test_budget_plan_matches_libero():
+    for h, d, r_min, lam in itertools.product(range(1, H + 1), range(0, 4), range(0, 3), [0, 0.25, 0.5, 0.75, 1]):
+        s, end = budget.budget_plan(jnp.array(h), d, r_min, jnp.array(lam, jnp.float32), H)
+        ref = lp_planner.budget_plan(h, d, r_min, lam, H)
+        assert (int(s), int(end)) == (ref.stride, ref.mask_end), (h, d, r_min, lam)
+
+
+def test_adaptive_matches_libero():
+    for h, d in itertools.product(range(1, H + 1), range(0, 4)):
+        cfg = budget.LoopConfig(d=d, planner="adaptive", rule="const", c=h, s_min=1)
+        s, end, hh, _ = budget.plan(cfg, jnp.zeros((1, H)))
+        ref = lp_planner.AdaptivePlanner(H, lp_hstar.HStarRule("const", c=h), s_min=1)(np.zeros(H), 0, d)
+        assert (int(s[0]), int(end[0]), int(hh[0])) == (ref.stride, ref.mask_end, ref.h_star), (h, d)
+
+
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_h_star_above_matches_libero(k):
+    rng = np.random.default_rng(k)
+    disp = rng.uniform(0, 1, size=(200, H))
+    for eta, min_h in [(0.5, 1), (0.8, 2), (0.95, 1)]:
+        cfg = budget.LoopConfig(rule="above", eta=eta, k=k, min_h=min_h, n_samples=2)
+        got = np.asarray(budget.h_star(cfg, jnp.asarray(disp)))
+        rule = lp_hstar.HStarRule("above", eta=eta, k=k, min_h=min_h)
+        ref = np.array([lp_hstar.hstar(x, 0, rule) for x in disp])
+        np.testing.assert_array_equal(got, ref)
+
+
+def test_shift():
+    chunk = jnp.arange(2 * H, dtype=jnp.float32).reshape(1, 2, H, 1)
+    out = budget.shift(chunk, jnp.array([[0, 3]]))
+    np.testing.assert_array_equal(out[0, 0, :, 0], np.arange(H))
+    np.testing.assert_array_equal(out[0, 1, :, 0], [11, 12, 13, 14, 15, 0, 0, 0])
+
+
+# ---------------------------------------------------------------- schedule on a fake environment
+
+L, B = 1, 3
+
+
+def j_of(obs):
+    """Fake reliable horizon of a chunk generated at observation obs (= time step): 2..6."""
+    return 2 + np.mod(obs, 5)
+
+
+def fake_fns(noisy: bool):
+    obs0 = jnp.zeros((L, B, 1))
+    zeros = jnp.zeros((L, B))
+
+    def step_fn(t, state, action):
+        info = dict(returned_episode_solved=zeros, returned_episode_returns=zeros,
+                    returned_episode_lengths=zeros.astype(jnp.int32))
+        return jnp.full((L, B, 1), t + 1.0), state, jnp.zeros((L, B), bool), info
+
+    def sample_fn(obs, noise):
+        idx = jnp.arange(H)[None, None, :, None]
+        base = 100 * obs[..., None] + idx  # action = 100 * (inference step) + index
+        if not noisy:
+            return base + 0 * noise
+        scale = (idx >= (2 + jnp.mod(obs[..., None], 5))).astype(jnp.float32)
+        return base + 0.01 * noise * scale  # dispersion ~0.01 from index j_of(obs) on, 0 before
+
+    def guided_fn(obs, noise, prev, weights):
+        return sample_fn(obs, noise)
+
+    def weights_fn(mask_end):
+        return jnp.zeros((*mask_end.shape, H))
+
+    return obs0, zeros, step_fn, sample_fn, guided_fn, weights_fn
+
+
+def reference(d, num_steps, stride_at):
+    """closed_loop.run_batch bookkeeping, plus eval_flow's start: first chunk at t = 0, inference also at t = 0."""
+    active_start, next_start, pending, out, plans = 0, 0, None, [], []
+    for t in range(num_steps):
+        if pending is not None and pending[1] == t:
+            active_start, pending = pending[0], None
+        if t == next_start:
+            s = stride_at(t)
+            plans.append((t, s))
+            pending, next_start = (t, t + d), t + s
+            if d == 0:
+                active_start, pending = t, None
+        out.append(100 * active_start + (t - active_start))
+    return np.array(out), plans
+
+
+@pytest.mark.parametrize("d,s", [(0, 1), (0, 3), (1, 1), (2, 2), (2, 4), (3, 5), (4, 4)])
+@pytest.mark.parametrize("guidance", [False, True])
+def test_fixed_schedule(d, s, guidance):
+    num_steps = 40
+    obs0, state0, step_fn, sample_fn, guided_fn, weights_fn = fake_fns(noisy=False)
+    cfg = budget.LoopConfig(d=d, s=s, guidance=guidance)
+    out, logs = budget.run_loop(cfg, H, 1, num_steps, obs0, state0, step_fn, sample_fn, guided_fn, weights_fn,
+                                jax.random.key(0), n_log=B)
+    want, plans = reference(d, num_steps, lambda t: s)
+    got = np.asarray(logs["action"])[:, 0, :, 0]  # (T, B)
+    for b in range(B):
+        np.testing.assert_allclose(got[:, b], want)
+    assert int(out["n_infer"][0, 0]) == 1 + len(plans)
+
+
+@pytest.mark.parametrize("d,r_min,lam", [(1, 0, 0.5), (1, 0, 1.0), (2, 0, 0.0), (1, 1, 0.5), (0, 0, 0.5)])
+def test_budget_schedule(d, r_min, lam):
+    num_steps = 60
+    obs0, state0, step_fn, sample_fn, guided_fn, weights_fn = fake_fns(noisy=True)
+    cfg = budget.LoopConfig(d=d, guidance=True, planner="budget", rule="above", eta=0.002, k=1, min_h=1,
+                            lam=lam, r_min=r_min, n_samples=8)
+    out, logs = budget.run_loop(cfg, H, 1, num_steps, obs0, state0, step_fn, sample_fn, guided_fn, weights_fn,
+                                jax.random.key(0), n_log=B)
+    want, plans = reference(d, num_steps, lambda t: lp_planner.budget_plan(int(j_of(t)), d, r_min, lam, H).stride)
+    got = np.round(np.asarray(logs["action"])[:, 0, :, 0])
+    for b in range(B):
+        np.testing.assert_array_equal(got[:, b], want)
+    # logged plans: h* = j_of(t) at every inference step
+    due = np.asarray(logs["due"])[:, 0, 0]
+    disp = np.asarray(logs["disp"])[:, 0, 0]
+    steps = np.flatnonzero(due)
+    assert [t for t, _ in plans] == steps.tolist()
+    np.testing.assert_array_equal(np.asarray(budget.h_star(cfg, jnp.asarray(disp[steps]))), j_of(steps))

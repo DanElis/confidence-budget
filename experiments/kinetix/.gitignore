@@ -1,4 +1,4 @@
 third_party/
 assets/
-runs/*/
-!runs/reproduce/
+runs/**/*.npz
+runs/smoke*/
