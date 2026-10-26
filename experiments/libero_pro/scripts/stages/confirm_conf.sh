@@ -13,7 +13,7 @@
 #   EPISODES=20 JOBS=4 by default (~10 h); re-running skips finished suites; report at any time:
 #   uv run python scripts/compare.py --ref runs/cf_rtck_s10_d8 runs/cf_* --out runs/confirm_report.md
 cd "$(dirname "$0")/../.." && source scripts/stages/lib.sh
-EPISODES=${EPISODES:-20}
+EPISODES=${CONFIRM_EPISODES:-20}  # lib.sh already sets EPISODES (10), so a plain ${EPISODES:-20} never applied
 SEED=${SEED:-1}
 D=${D:-8}
 K=${K:-4}
