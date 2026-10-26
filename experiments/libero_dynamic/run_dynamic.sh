@@ -32,6 +32,9 @@ RUNS=${RUNS:-$HERE/runs}
 OUT="$RUNS/$NAME"
 mkdir -p "$OUT"
 [[ $STRATEGY == rtc ]] && SERVER_ARGS=(--mode rtc "${SERVER_ARGS[@]}")
+# the runner rejects chunks shorter than K; like the paper's servers, return max(10, K) actions (the RTC mask then
+# also ends there, their default) unless --actions-per-chunk is given explicitly
+[[ " ${SERVER_ARGS[*]} " == *" --actions-per-chunk "* ]] || SERVER_ARGS+=(--actions-per-chunk $(( K > 10 ? K : 10 )))
 DPY="$DYN/.venv/bin/python"
 export PYTHONPATH="$DYN:$DYN/scripts:$OPENPI/packages/openpi-client/src"
 export LIBERO_CONFIG_PATH="$DYN/libero/libero/configs" MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=${GPU:-0}
