@@ -54,6 +54,7 @@ from libero_pro_suites import (  # noqa: E402
     suite_name,
 )
 from planner import AdaptivePlanner, BudgetPlanner, EntropyLambda, FixedPlanner  # noqa: E402
+from shared_prefix import predict_chunk_shared  # noqa: E402
 from selection import (  # noqa: E402
     MASK_MODES,
     SELECTS,
@@ -107,6 +108,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--sample-call", choices=["separate", "joint"], default="separate",
                    help="with guidance: K unguided samples then one guided pass (separate, two calls), or K unguided "
                         "and K guided rows in one call (joint)")
+    p.add_argument("--shared-prefix", action="store_true",
+                   help="K > 1: encode each observation's prefix once and repeat its KV cache over the samples "
+                        "(shared_prefix.py) instead of repeating the observation")
     p.add_argument("--signal", choices=["entropy", "agreement"], default="entropy",
                    help="what the budget / adaptive planner's h* rule reads (agreement needs --n-samples > 1)")
     # outputs
@@ -251,6 +255,16 @@ def main() -> None:
         """
         n, k, dev = len(observations), args.n_samples, args.device
         noise_k = expand_noise(noise, k)  # (n*K, H, A_max), row i*K is the episode's noise
+
+        def predict_rows(repeats: int, noise_rows: torch.Tensor, **rtc_kwargs) -> torch.Tensor:
+            """``repeats`` samples per observation, rows observation-major; one prefix pass per observation
+            with --shared-prefix, else the observation is repeated."""
+            if args.shared_prefix:
+                return predict_chunk_shared(policy, to_batch(observations, task_description), repeats,
+                                            noise=noise_rows.to(dev), **rtc_kwargs)
+            return policy.predict_action_chunk(to_batch([o for o in observations for _ in range(repeats)],
+                                                        task_description), noise=noise_rows.to(dev), **rtc_kwargs)
+
         guided_rows, w = None, None
         if leftover is not None:
             rtc_w = weights_proc.prefix_weights(delay, mask_end, n, horizon, horizon).to(dev)
@@ -261,17 +275,14 @@ def main() -> None:
             rtc_proc.weight_override = w2
             try:
                 with torch.no_grad():
-                    out = policy.predict_action_chunk(
-                        to_batch([o for o in observations for _ in range(2 * k)], task_description),
-                        noise=noise2.to(dev), inference_delay=delay, prev_chunk_left_over=left2.to(dev),
-                        execution_horizon=mask2)
+                    out = predict_rows(2 * k, noise2, inference_delay=delay, prev_chunk_left_over=left2.to(dev),
+                                       execution_horizon=mask2)
             finally:
                 rtc_proc.weight_override = None
             samples, guided_rows = split_joint(out.float(), n, k)
         else:
             with torch.no_grad():  # no leftover: the RTC processor leaves these unguided
-                samples = policy.predict_action_chunk(to_batch([o for o in observations for _ in range(k)],
-                                                               task_description), noise=noise_k.to(dev))
+                samples = predict_rows(k, noise_k)
             samples = samples.float().reshape(n, k, horizon, -1)
         real = samples[..., :ACTION_DIM]
         disp = dispersion(real)

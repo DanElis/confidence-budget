@@ -222,3 +222,27 @@ def test_sample_call_flag():
 
     assert parse_args(["--out", "x"]).sample_call == "separate"
     assert parse_args(["--out", "x", "--sample-call", "joint"]).sample_call == "joint"
+
+
+# ---------------------------------------------------------------- shared prefix
+
+def test_expand_cache_repeats_rows_observation_major():
+    from lerobot.policies.common import vla_utils
+    from shared_prefix import expand_cache
+
+    keys = torch.arange(2 * 1 * 3 * 4, dtype=torch.float32).view(2, 1, 3, 4)  # (batch, heads, seq, dim)
+    cache = vla_utils.DynamicCache(((keys, keys + 100, None), (keys * 2, keys * 2 + 100, None)))
+    out = list(expand_cache(cache, 3))
+    assert len(out) == 2
+    for (k_out, v_out, _), scale in zip(out, (1, 2), strict=True):
+        assert k_out.shape == (6, 1, 3, 4)
+        for row in range(6):
+            torch.testing.assert_close(k_out[row], keys[row // 3] * scale)
+            torch.testing.assert_close(v_out[row], keys[row // 3] * scale + 100)
+
+
+def test_shared_prefix_flag():
+    from eval_libero import parse_args
+
+    assert not parse_args(["--out", "x"]).shared_prefix
+    assert parse_args(["--out", "x", "--shared-prefix"]).shared_prefix
