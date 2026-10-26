@@ -10,6 +10,7 @@
 - `experiments/libero_pro` — замкнутый цикл: `closed_loop.py` (расписание на каждую среду, задержка, guidance), `planner.py` (Fixed / Budget / Adaptive), `hstar.py`, `scripts/stages/lib.sh` (параллельные запуски с ожиданием памяти, повторами, таймаутом).
 - `experiments/robotwin` — RoboTwin 2.0 через серверы симулятора (`robotwin_server.py`, `remote_env.py`, `wire.py`), модель в venv `libero_pro`.
 - `experiments/kinetix` — Kinetix через `real-time-chunking-kinetix@9296f31` (`setup.sh` ставит в `third_party/` и качает политики `bc/`); `run_points.py` (через `run.sh`) — naive/RTC в выбранных точках (d, s) на `eval_flow.eval`; `budget.py` (планировщики fixed/budget/adaptive и пошаговый цикл с расписанием на каждую среду, JAX) и `budget_loop.py` (`./run.sh budget_loop.py --config label:key=val,...`, калибровка `--calibrate`).
+- `experiments/libero_dynamic` — LIBERO-Dynamic (движущиеся объекты, задержка в секундах): `setup.sh` ставит бенчмарк в свой venv (Python 3.10), `policy_server.py` — наша π0.5 на их websocket-протоколе (venv `libero_pro`), `run_dynamic.sh NAME sync|async|rtc K LATENCY [server args]` — их раннер и стратегии без изменений.
 - Запуски, тесты и установку делает пользователь на сервере; локально только код и git (skill `remote-server`).
 - Ветка `h1-offline-check`, PR #1 в `github.com/DanElis/confidence-budget`.
 
@@ -29,6 +30,7 @@
 ```bash
 cd experiments/libero_pro && uv run python -m pytest -q tests ../robotwin/tests ../h1/tests
 cd experiments/kinetix && uv run --project third_party/real-time-chunking-kinetix --with pytest python -m pytest -q tests
+cd experiments/libero_pro && uv run --with websockets --with msgpack python -m pytest -q ../libero_dynamic/tests
 ```
 
 ## Git
