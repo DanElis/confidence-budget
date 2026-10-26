@@ -29,7 +29,7 @@ echo "== evaluator venv (Python 3.10)"
 if [[ ! -x "$DYN/.venv/bin/python" ]]; then
   uv venv --python 3.10 "$DYN/.venv"
 fi
-(cd "$DYN" && uv pip install --python .venv/bin/python -r requirements.txt && uv pip install --python .venv/bin/python -e .)
+(cd "$DYN" && uv pip install --python .venv/bin/python --overrides "$HERE/overrides.txt" -r requirements.txt && uv pip install --python .venv/bin/python --overrides "$HERE/overrides.txt" -e .)
 uv pip install --python "$DYN/.venv/bin/python" -e "$OPENPI/packages/openpi-client"
 
 echo "== preflight of the dynamic configs (no policy)"
