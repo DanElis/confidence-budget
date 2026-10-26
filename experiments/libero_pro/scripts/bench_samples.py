@@ -1,14 +1,14 @@
 #!/usr/bin/env python
-"""Time and check K noise samples per observation for PI0.5: repeated observations vs one shared prefix.
+"""Wall time of one PI0.5 inference vs batch size, with K noise samples per observation.
 
-On real LIBERO observations of --n environments, for the same noise:
-    k1        one sample per observation (plain RTC call)
-    rep_K     K samples, observation repeated K times (what eval_libero did before --shared-prefix)
-    shared_K  K samples, prefix encoded once (shared_prefix.py)
-    rep_2K / shared_2K   the joint call of --sample-call joint: K unguided + K guided rows with RTC
-Prints the median wall time per call and the max |shared - repeated| difference of the actions.
+The batch size n is the number of distinct observations in one call (n = 1: one robot; n > 1: environments
+batched in simulation for throughput). For each n in --n, on real LIBERO observations and the same noise:
+    k1                 one sample per observation (plain call)
+    rep_K / shared_K   K samples per observation: observation repeated K times / prefix encoded once
+    rep_2K / shared_2K the joint call of --sample-call joint: K unguided + K guided rows (RTC on the guided ones)
+Prints the median seconds per call, the ratio to k1 at the same n, and max |shared - repeated|.
 
-    uv run python scripts/bench_samples.py --n 5 --k 4 --repeats 10
+    uv run python scripts/bench_samples.py --n 1 2 5 10 --k 2 4 --repeats 10
 """
 
 from __future__ import annotations
@@ -40,8 +40,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--policy", default="lerobot/pi05_libero_finetuned")
     p.add_argument("--suite", default="libero_object")
-    p.add_argument("--n", type=int, default=5, help="environments (distinct observations)")
-    p.add_argument("--k", type=int, default=4)
+    p.add_argument("--n", type=int, nargs="+", default=[1, 2, 5, 10], help="batch sizes (distinct observations)")
+    p.add_argument("--k", type=int, nargs="+", default=[2, 4], help="samples per observation")
     p.add_argument("--repeats", type=int, default=10)
     p.add_argument("--delay", type=int, default=8)
     p.add_argument("--mask-end", type=int, default=13)
@@ -64,26 +64,19 @@ def main() -> None:
     env_cfg = LiberoEnvConfig(task=args.suite, episode_length=MAX_STEPS)
     env_pre, _ = env_cfg.get_env_processors()
     suite = benchmark.get_benchmark_dict()[args.suite]()
+    n_max = max(args.n)
     envs = [LiberoEnv(task_suite=suite, task_id=0, task_suite_name=args.suite,
                       camera_name=parse_camera_names(env_cfg.camera_name), init_states=True, episode_length=MAX_STEPS,
-                      episode_index=i, n_envs=1, **env_cfg.gym_kwargs) for i in range(args.n)]
-    observations = [env.reset()[0] for env in envs]
+                      episode_index=i % 50, n_envs=1, **env_cfg.gym_kwargs) for i in range(n_max)]
+    all_obs = [env.reset()[0] for env in envs]
+    for env in envs:
+        env.close()
     task = suite.get_task(0).language
-
-    def to_batch(obs_list):
-        obs = preprocess_observation(stack_observations(obs_list))
-        obs["task"] = [task] * len(obs_list)
-        return preprocessor(env_pre(obs))
-
-    n, k = args.n, args.k
-    g = torch.Generator().manual_seed(0)
-    noise = torch.randn(n, horizon, a_max, generator=g)
-    noise_k = expand_noise(noise, k)
     sync = (lambda: torch.cuda.synchronize()) if args.device.startswith("cuda") else (lambda: None)  # noqa: E731
 
     def timed(fn):
         with torch.no_grad():
-            out = fn()  # warm-up
+            out = fn()  # warm-up (also the output)
             sync()
             times = []
             for _ in range(args.repeats):
@@ -93,40 +86,55 @@ def main() -> None:
                 times.append(time.perf_counter() - t0)
         return out.float().cpu(), float(np.median(times))
 
-    def repeated(m, rows, **kw):
-        return lambda: policy.predict_action_chunk(to_batch([o for o in observations for _ in range(m)]),
-                                                   noise=rows.to(args.device), **kw)
+    rows = []
+    for n in args.n:
+        observations = all_obs[:n]
 
-    def shared(m, rows, **kw):
-        return lambda: predict_chunk_shared(policy, to_batch(observations), m, noise=rows.to(args.device), **kw)
+        def to_batch(obs_list):
+            obs = preprocess_observation(stack_observations(obs_list))
+            obs["task"] = [task] * len(obs_list)
+            return preprocessor(env_pre(obs))
 
-    results = {}
-    base, results["k1"] = timed(lambda: policy.predict_action_chunk(to_batch(observations), noise=noise.to(args.device)))
-    out_rep, results[f"rep_{k}"] = timed(repeated(k, noise_k))
-    out_sh, results[f"shared_{k}"] = timed(shared(k, noise_k))
-    diff_k = float((out_rep - out_sh).abs().max())
+        def repeated(m, noise_rows, **kw):
+            return lambda: policy.predict_action_chunk(to_batch([o for o in observations for _ in range(m)]),
+                                                       noise=noise_rows.to(args.device), **kw)
 
-    leftover = torch.zeros(n, horizon, base.shape[-1])
-    leftover[:, : horizon - args.delay] = base[:, args.delay:]  # the first chunk shifted by s = d
-    mask_end = torch.full((n,), args.mask_end)
-    w = proc.prefix_weights(args.delay, mask_end, n, horizon, horizon)
-    noise2, left2, mask2, w2 = joint_batch(noise_k, leftover, mask_end, w, k)
-    kw = dict(inference_delay=args.delay, prev_chunk_left_over=left2.to(args.device), execution_horizon=mask2)
-    proc.weight_override = w2.to(args.device)
-    try:
-        out_rep2, results[f"rep_{2 * k}_joint"] = timed(repeated(2 * k, noise2, **kw))
-        out_sh2, results[f"shared_{2 * k}_joint"] = timed(shared(2 * k, noise2, **kw))
-    finally:
-        proc.weight_override = None
-    diff_2k = float((out_rep2 - out_sh2).abs().max())
-    for env in envs:
-        env.close()
+        def shared(m, noise_rows, **kw):
+            return lambda: predict_chunk_shared(policy, to_batch(observations), m, noise=noise_rows.to(args.device),
+                                                **kw)
 
-    print(f"n={n} K={k} H={horizon} (median of {args.repeats} calls, seconds per call)")
-    for name, t in results.items():
-        print(f"  {name:16s} {t:.3f}  ({t / results['k1']:.2f}x k1)")
-    print(f"max |shared - repeated|: K samples {diff_k:.2e}, joint 2K {diff_2k:.2e} "
-          f"(action scale: {float(base.abs().mean()):.3f})")
+        noise = torch.randn(n, horizon, a_max, generator=torch.Generator().manual_seed(n))
+        base, t_k1 = timed(lambda: policy.predict_action_chunk(to_batch(observations), noise=noise.to(args.device)))
+        rows.append((n, "k1", 1, t_k1, t_k1, float("nan")))
+        leftover = torch.zeros(n, horizon, base.shape[-1])
+        leftover[:, : horizon - args.delay] = base[:, args.delay:]  # the chunk shifted by s = d
+        mask_end = torch.full((n,), args.mask_end)
+        w = proc.prefix_weights(args.delay, mask_end, n, horizon, horizon)
+        for k in args.k:
+            noise_k = expand_noise(noise, k)
+            out_rep, t_rep = timed(repeated(k, noise_k))
+            out_sh, t_sh = timed(shared(k, noise_k))
+            diff = float((out_rep - out_sh).abs().max())
+            rows += [(n, f"rep_{k}", k, t_rep, t_k1, float("nan")), (n, f"shared_{k}", k, t_sh, t_k1, diff)]
+            noise2, left2, mask2, w2 = joint_batch(noise_k, leftover, mask_end, w, k)
+            kw = dict(inference_delay=args.delay, prev_chunk_left_over=left2.to(args.device), execution_horizon=mask2)
+            proc.weight_override = w2.to(args.device)
+            try:
+                out_rep2, t_rep2 = timed(repeated(2 * k, noise2, **kw))
+                out_sh2, t_sh2 = timed(shared(2 * k, noise2, **kw))
+            finally:
+                proc.weight_override = None
+            diff2 = float((out_rep2 - out_sh2).abs().max())
+            rows += [(n, f"rep_{2 * k}_joint", 2 * k, t_rep2, t_k1, float("nan")),
+                     (n, f"shared_{2 * k}_joint", 2 * k, t_sh2, t_k1, diff2)]
+        print(f"n={n} done", flush=True)
+
+    print(f"\nPI0.5, H={horizon}, median of {args.repeats} calls")
+    print("| batch n | variant | rows / obs. | rows in call | s / call | × k1 (same n) | max |shared - rep| |")
+    print("|---|---|---|---|---|---|---|")
+    for n, name, m, t, t1, diff in rows:
+        d = "" if np.isnan(diff) else f"{diff:.1e}"
+        print(f"| {n} | {name} | {m} | {n * m} | {t:.3f} | {t / t1:.2f} | {d} |")
     sys.stdout.flush()
     os._exit(0)
 
