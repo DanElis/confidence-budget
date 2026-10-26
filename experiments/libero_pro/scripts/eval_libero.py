@@ -61,7 +61,9 @@ from selection import (  # noqa: E402
     conf_weights,
     dispersion,
     expand_noise,
+    joint_batch,
     select_index,
+    split_joint,
 )
 
 log = logging.getLogger("eval_libero")
@@ -102,6 +104,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--mask-mode", choices=MASK_MODES, default="rtc")
     p.add_argument("--conf-sigma", type=float, default=1.0, help="confidence mask scale, in units of --conf-ref")
     p.add_argument("--conf-ref", type=float, default=1.0, help="dispersion scale (median dispersion of a reference run)")
+    p.add_argument("--sample-call", choices=["separate", "joint"], default="separate",
+                   help="with guidance: K unguided samples then one guided pass (separate, two calls), or K unguided "
+                        "and K guided rows in one call (joint)")
     p.add_argument("--signal", choices=["entropy", "agreement"], default="entropy",
                    help="what the budget / adaptive planner's h* rule reads (agreement needs --n-samples > 1)")
     # outputs
@@ -238,13 +243,36 @@ def main() -> None:
 
     def infer_samples(observations, noise, leftover, delay, mask_end, leftover_disp, leftover_len,
                       task_description: str) -> Chunk:
-        """K unguided samples -> dispersion, agreement, choice; with guidance the chosen noise is generated with RTC."""
+        """K unguided samples -> dispersion, agreement, choice; with guidance the chosen noise is generated with RTC.
+
+        --sample-call separate: K unguided samples, then one guided pass for the chosen noise (two calls).
+        --sample-call joint: one call with K unguided and K guided rows (same noises); the chosen guided row is
+        executed. Same choice as separate, one call of a 2x larger batch.
+        """
         n, k, dev = len(observations), args.n_samples, args.device
         noise_k = expand_noise(noise, k)  # (n*K, H, A_max), row i*K is the episode's noise
-        with torch.no_grad():  # no leftover: the RTC processor leaves these unguided
-            samples = policy.predict_action_chunk(to_batch([o for o in observations for _ in range(k)],
-                                                           task_description), noise=noise_k.to(dev))
-        samples = samples.float().reshape(n, k, horizon, -1)
+        guided_rows, w = None, None
+        if leftover is not None:
+            rtc_w = weights_proc.prefix_weights(delay, mask_end, n, horizon, horizon).to(dev)
+            w = conf_weights(args.mask_mode, rtc_w, None if leftover_disp is None else leftover_disp.to(dev),
+                             delay, mask_end, args.conf_sigma * args.conf_ref)
+        if leftover is not None and args.guidance != "none" and args.sample_call == "joint":
+            noise2, left2, mask2, w2 = joint_batch(noise_k, leftover, mask_end, w, k)
+            rtc_proc.weight_override = w2
+            try:
+                with torch.no_grad():
+                    out = policy.predict_action_chunk(
+                        to_batch([o for o in observations for _ in range(2 * k)], task_description),
+                        noise=noise2.to(dev), inference_delay=delay, prev_chunk_left_over=left2.to(dev),
+                        execution_horizon=mask2)
+            finally:
+                rtc_proc.weight_override = None
+            samples, guided_rows = split_joint(out.float(), n, k)
+        else:
+            with torch.no_grad():  # no leftover: the RTC processor leaves these unguided
+                samples = policy.predict_action_chunk(to_batch([o for o in observations for _ in range(k)],
+                                                               task_description), noise=noise_k.to(dev))
+            samples = samples.float().reshape(n, k, horizon, -1)
         real = samples[..., :ACTION_DIM]
         disp = dispersion(real)
         sel, z = torch.zeros(n, dtype=torch.long), torch.zeros(n, horizon)
@@ -252,12 +280,11 @@ def main() -> None:
             model = samples[:, 0]
         else:
             left = leftover[..., :ACTION_DIM].to(dev)
-            rtc_w = weights_proc.prefix_weights(delay, mask_end, n, horizon, horizon).to(dev)
-            w = conf_weights(args.mask_mode, rtc_w, None if leftover_disp is None else leftover_disp.to(dev),
-                             delay, mask_end, args.conf_sigma * args.conf_ref)
             sel = select_index(args.select, real, left, w)
             z = agreement(real, left, leftover_len)
-            if args.guidance != "none":
+            if guided_rows is not None:
+                model = guided_rows[torch.arange(n, device=guided_rows.device), sel.to(guided_rows.device)]
+            elif args.guidance != "none":
                 chosen = noise_k.view(n, k, *noise.shape[1:])[torch.arange(n), sel]
                 rtc_proc.weight_override = w
                 try:
@@ -276,8 +303,19 @@ def main() -> None:
                      signal=z_np if args.signal == "agreement" else None, dispersion=disp_np,
                      extras={"dispersion": disp_np, "agree": z_np, "sel": sel.numpy()})
 
+    infer_time = {"s": 0.0, "n": 0}  # wall time per inference (policy calls + pre/post-processing), per suite
+
     def make_infer(task_description: str):
         def infer(observations, noise, leftover, delay, mask_end, leftover_disp=None, leftover_len=None) -> Chunk:
+            started = time.perf_counter()
+            chunk = infer_once(observations, noise, leftover, delay, mask_end, leftover_disp, leftover_len)
+            if str(args.device).startswith("cuda"):
+                torch.cuda.synchronize()
+            infer_time["s"] += time.perf_counter() - started
+            infer_time["n"] += 1
+            return chunk
+
+        def infer_once(observations, noise, leftover, delay, mask_end, leftover_disp, leftover_len) -> Chunk:
             if args.n_samples > 1:
                 return infer_samples(observations, noise, leftover, delay, mask_end, leftover_disp, leftover_len,
                                      task_description)
@@ -311,6 +349,7 @@ def main() -> None:
         task_ids = args.task_ids if args.task_ids is not None else list(range(suite.n_tasks))
         episodes, batches, chunk_log, actions_all = [], [], [], []
         started = time.time()
+        infer_time.update(s=0.0, n=0)
         for tid in task_ids:
             task = suite.get_task(tid)
             infer = make_infer(task.language)
@@ -351,6 +390,7 @@ def main() -> None:
                          sum(e["success"] for e in done), len(done), len(done), time.time() - started)
         result = summarize(name, episodes, batches, task_ids)
         result["seconds"] = time.time() - started
+        result["infer_seconds_per_call"] = infer_time["s"] / max(infer_time["n"], 1)
         out_file.write_text(json.dumps(result, indent=1))
         (args.out / f"{name}_chunks.json").write_text(json.dumps(chunk_log))
         if actions_all:

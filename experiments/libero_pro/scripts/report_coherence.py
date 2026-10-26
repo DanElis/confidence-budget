@@ -29,11 +29,13 @@ def runs_for_delay(root: Path, d: int) -> list[Path]:
 
 
 def extra_table(runs: list[Path], suites: list[str]) -> str:
-    lines = ["| run | mean h* | sel ≠ 0 | episodes |", "|---|---|---|---|"]
+    lines = ["| run | mean h* | sel ≠ 0 | s / inference | episodes |", "|---|---|---|---|---|"]
     for r in runs:
         run = load_run(r, suites)
         n = sum(len(x["episodes"]) for x in run.values())
-        lines.append(f"| {r.name} | {mean_key(run, 'mean_h_star'):.1f} | {mean_key(run, 'frac_sel'):.2f} | {n} |")
+        secs = [x["infer_seconds_per_call"] for x in run.values() if "infer_seconds_per_call" in x]
+        sec = f"{np.mean(secs):.3f}" if secs else "—"
+        lines.append(f"| {r.name} | {mean_key(run, 'mean_h_star'):.1f} | {mean_key(run, 'frac_sel'):.2f} | {sec} | {n} |")
     return "\n".join(lines) + "\n"
 
 

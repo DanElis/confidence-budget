@@ -32,6 +32,28 @@ def expand_noise(noise: torch.Tensor, k: int) -> torch.Tensor:
     return torch.stack(out)
 
 
+def joint_batch(noise_k: torch.Tensor, leftover: torch.Tensor, mask_end: torch.Tensor, weights: torch.Tensor,
+                k: int):
+    """Rows of one policy call with K unguided and K guided samples per environment (same K noises in both halves).
+
+    noise_k (n*K, H, A) as from expand_noise, leftover (n, H, A), mask_end (n,), weights (n, H) ->
+    noise, leftover, mask_end, weights for n*2K rows ordered [env 0: K unguided, K guided | env 1: ...];
+    unguided rows get weight 0, so the guidance correction vanishes and they are plain samples.
+    """
+    n = leftover.shape[0]
+    noise = noise_k.view(n, k, *noise_k.shape[1:])
+    noise2 = torch.cat([noise, noise], dim=1).reshape(n * 2 * k, *noise_k.shape[1:])
+    w = torch.cat([torch.zeros(n, k, weights.shape[1], dtype=weights.dtype, device=weights.device),
+                   weights[:, None].expand(n, k, weights.shape[1])], dim=1).reshape(n * 2 * k, weights.shape[1])
+    return (noise2, leftover.repeat_interleave(2 * k, 0), mask_end.repeat_interleave(2 * k, 0), w)
+
+
+def split_joint(out: torch.Tensor, n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """(n*2K, H, A) output of a joint_batch call -> unguided (n, K, H, A), guided (n, K, H, A)."""
+    out = out.reshape(n, 2 * k, *out.shape[1:])
+    return out[:, :k], out[:, k:]
+
+
 def dispersion(samples: torch.Tensor) -> torch.Tensor:
     """(B, K, H, A) -> (B, H): std across samples, mean over action dims."""
     return samples.std(dim=1, unbiased=True).mean(dim=-1)

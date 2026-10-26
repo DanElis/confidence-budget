@@ -10,10 +10,19 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT.parent / "h1"))
 from closed_loop import Chunk, LoopConfig, run_batch  # noqa: E402
 from hstar import HStarRule  # noqa: E402
 from planner import AdaptivePlanner, FixedPlanner  # noqa: E402
-from selection import agreement, conf_weights, dispersion, expand_noise, select_index  # noqa: E402
+from selection import (  # noqa: E402
+    agreement,
+    conf_weights,
+    dispersion,
+    expand_noise,
+    joint_batch,
+    select_index,
+    split_joint,
+)
 
 H = 10
 
@@ -168,3 +177,48 @@ def test_sample_cli_checks():
                 ok + ["--record-entropy"]):
         with pytest.raises(SystemExit):
             check_sample_args(parse_args(bad))
+
+
+# ---------------------------------------------------------------- joint call: K unguided + K guided rows
+
+def test_joint_batch_layout_and_split():
+    n, k, a = 2, 3, 4
+    noise_k = torch.arange(n * k, dtype=torch.float32)[:, None, None].expand(n * k, H, a).clone()
+    leftover = torch.stack([torch.full((H, a), 10.0), torch.full((H, a), 20.0)])
+    mask_end = torch.tensor([5, 7])
+    w = torch.stack([torch.full((H,), 0.5), torch.full((H,), 0.9)])
+    noise2, left2, mask2, w2 = joint_batch(noise_k, leftover, mask_end, w, k)
+    assert noise2.shape == (n * 2 * k, H, a) and w2.shape == (n * 2 * k, H)
+    # env 0: noises 0,1,2 unguided then 0,1,2 guided; env 1: 3,4,5 twice
+    assert noise2[:, 0, 0].tolist() == [0, 1, 2, 0, 1, 2, 3, 4, 5, 3, 4, 5]
+    assert left2[:, 0, 0].tolist() == [10] * 6 + [20] * 6
+    assert mask2.tolist() == [5] * 6 + [7] * 6
+    assert w2[:, 0].tolist() == pytest.approx([0, 0, 0, 0.5, 0.5, 0.5, 0, 0, 0, 0.9, 0.9, 0.9])
+    out = torch.arange(n * 2 * k, dtype=torch.float32)[:, None, None].expand(n * 2 * k, H, a)
+    unguided, guided = split_joint(out, n, k)
+    assert unguided[:, :, 0, 0].tolist() == [[0, 1, 2], [6, 7, 8]]
+    assert guided[:, :, 0, 0].tolist() == [[3, 4, 5], [9, 10, 11]]
+
+
+def test_zero_weight_rows_are_unguided():
+    from h1.guidance import BatchRTCProcessor, make_rtc_config
+
+    proc = BatchRTCProcessor(make_rtc_config("exp", 10.0, 20), jacobian=False)
+    g = torch.Generator().manual_seed(2)
+    x = torch.randn(4, H, 3, generator=g)
+    prev = torch.randn(4, H, 3, generator=g)
+    velocity = lambda x_t: 0.5 * x_t + 1.0  # noqa: E731
+    proc.weight_override = torch.cat([torch.zeros(2, H), torch.ones(2, H)])
+    out = proc.denoise_step(x, prev, 2, 0.5, velocity, execution_horizon=torch.tensor([8, 8, 8, 8]))
+    torch.testing.assert_close(out[:2], velocity(x[:2]))  # zero weights: plain velocity
+    assert not torch.allclose(out[2:], velocity(x[2:]))  # guided rows are corrected
+    proc.weight_override = None
+    plain = proc.denoise_step(x, prev, 2, 0.5, velocity, execution_horizon=torch.tensor([8, 8, 8, 8]))
+    assert not torch.allclose(plain, velocity(x))  # without the override the RTC mask applies
+
+
+def test_sample_call_flag():
+    from eval_libero import parse_args
+
+    assert parse_args(["--out", "x"]).sample_call == "separate"
+    assert parse_args(["--out", "x", "--sample-call", "joint"]).sample_call == "joint"
