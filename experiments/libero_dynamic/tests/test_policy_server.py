@@ -88,3 +88,23 @@ def test_plan_step_from_agreement():
 def test_adaptive_cli_checks():
     with pytest.raises(SystemExit):
         ps.parse_args(["--mode", "rtc", "--adaptive"])  # needs K > 1
+
+
+def test_aac_h_star_matches_formula():
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        disp = rng.uniform(0, 1, 50)
+        mean = {h: disp[:h].mean() for h in range(1, 51)}
+        gains = {h: mean[h + 1] - mean[h] for h in range(1, 50)}
+        want = max(gains, key=lambda h: (gains[h], -h))
+        assert ps.aac_h_star(disp) == want
+    flat_then_jump = np.r_[np.full(10, 0.1), np.full(40, 1.0)]
+    assert ps.aac_h_star(flat_then_jump) == 10
+    assert ps.aac_h_star(flat_then_jump, min_h=20) == 20
+
+
+def test_plan_step_aac():
+    srv = make_planner(argv=["--rule", "aac", "--s-max", "20"])
+    disp = np.r_[np.full(10, 0.1), np.full(40, 1.0)]
+    assert srv.plan_step(None, 4, disp) == (10, 6)  # works on the first chunk too: needs only the new samples
+    assert srv.plan_step(np.zeros(50), 4, np.full(50, 0.2))[1] == 4  # flat profile: h* = 1, s = s_min

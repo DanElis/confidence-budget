@@ -109,6 +109,14 @@ def leftover_tensor(obs: dict, horizon: int) -> tuple[torch.Tensor | None, int]:
     return out, len(left)
 
 
+def aac_h_star(disp: np.ndarray, min_h: int = 1) -> int:
+    """AAC [13] Eq. 5 on a per-action dispersion profile: h* = max(argmax_h (D_{h+1} - D_h), min_h)."""
+    horizon = len(disp)
+    prefix_mean = np.cumsum(disp) / np.arange(1, horizon + 1)
+    h = int(np.argmax(np.diff(prefix_mean))) + 1  # diff index j is D_{j+2} - D_{j+1}
+    return int(min(max(h, min_h), horizon))
+
+
 # ---------------------------------------------------------------- policy
 
 class Server:
@@ -142,7 +150,7 @@ class Server:
                 "rtc_conditioning_supported": a.mode == "rtc", "rtc_execution_horizon": self.exec_h,
                 "n_samples": a.n_samples, "select": a.select, "mask_mode": a.mask_mode,
                 "conf_sigma": a.conf_sigma, "conf_ref": a.conf_ref, "seed": a.seed, "adaptive": a.adaptive,
-                "eta": a.eta, "s_min": a.s_min, "s_max": a.s_max}
+                "rule": a.rule, "eta": a.eta, "aac_min_h": a.aac_min_h, "s_min": a.s_min, "s_max": a.s_max}
 
     def batch(self, obs: dict) -> dict:
         return self.pre({"observation.images.image": as_image(obs["observation/image"]),
@@ -219,7 +227,7 @@ class Server:
         plan: dict[str, Any] = {"sel": sel}
         length = self.apc
         if a.adaptive:
-            h, s = self.plan_step(z, delay)
+            h, s = self.plan_step(z, delay, disp)
             length = s + delay
             plan.update(h_star=h, s=s)
         plan["len"] = length
@@ -232,18 +240,27 @@ class Server:
             self.log.flush()
         return chosen, plan
 
-    def plan_step(self, z: np.ndarray | None, delay: int) -> tuple[int, int]:
-        """h* = first index where the old plan leaves the cloud of new samples (z > eta), H if never;
-        s = clip(h* - d, s_min, s_max). The first chunk of an episode (no old plan) gets s_min.
+    def plan_step(self, z: np.ndarray | None, delay: int, disp: np.ndarray | None = None) -> tuple[int, int]:
+        """Reliable horizon h* and replanning step s = clip(h* - d, s_min, s_max).
+
+        --rule agree: h* = first index where the old plan leaves the cloud of new samples (z > eta), H if never;
+            the first chunk of an episode (no old plan) gets s_min.
+        --rule aac:   h* = argmax_h (D_{h+1} - D_h), D_h = mean dispersion of the new samples over the first h
+            actions (AAC [13], Eq. 5, with the dispersion in place of the action entropy), at least --aac-min-h.
 
         With the runner's --prefetch-threshold d, a chunk of length s + d is executed for s steps before the next
         request (its last d actions cover the next inference), so s is the replanning step."""
         a = self.args
         s_min = a.s_min if a.s_min is not None else max(delay, 1)
         s_max = max(min(a.s_max, self.horizon - delay), s_min)
-        if z is None:
-            return self.horizon, s_min
-        h = int(self.rule(z, 0))
+        if a.rule == "aac":
+            if disp is None:
+                return self.horizon, s_min
+            h = aac_h_star(np.asarray(disp, dtype=np.float64), a.aac_min_h)
+        else:
+            if z is None:
+                return self.horizon, s_min
+            h = int(self.rule(z, 0))
         return h, int(np.clip(h - delay, s_min, s_max))
 
 
@@ -299,7 +316,10 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--adaptive", action="store_true",
                    help="replanning step from plan agreement; run the runner with --prefetch-threshold d")
-    p.add_argument("--eta", type=float, default=3.0, help="adaptive: z threshold of the agreement rule")
+    p.add_argument("--rule", choices=["agree", "aac"], default="agree",
+                   help="adaptive: h* from plan agreement (z > eta) or from the growth of the samples' dispersion (AAC)")
+    p.add_argument("--eta", type=float, default=3.0, help="adaptive, agree: z threshold")
+    p.add_argument("--aac-min-h", type=int, default=1, help="adaptive, aac: lower bound of h*")
     p.add_argument("--s-min", type=int, default=None, help="adaptive: lower bound of s (default d)")
     p.add_argument("--s-max", type=int, default=20, help="adaptive: upper bound of s")
     p.add_argument("--log-jsonl", default=None, help="append per-request signals (z, dispersion, plan) here")
