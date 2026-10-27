@@ -11,6 +11,13 @@
 # all 40 tasks x levels x trajectories), SERVERS (policy server processes, 4), WORKERS (simulator workers, 8),
 # PORT (8124), RUNS (runs). Full configuration: 3 speeds x 600 = 1800 episodes. Finished speeds are skipped.
 #
+# RUNNER_ARGS: extra arguments for the benchmark runner (e.g. "--prefetch-threshold 4" for the adaptive step).
+#
+# Adaptive step from plan agreement + confidence mask + coherent sample (RTC strategy of the runner; the server sets
+# the step through the chunk length s + d, the runner requests when d actions are left; K = s_min + d):
+#   RUNNER_ARGS="--prefetch-threshold 4" bash run_dynamic.sh ada rtc 8 0.175 --n-samples 4 --select coherent \
+#     --mask-mode rtc_x_conf --conf-sigma 1 --conf-ref 0.03716 --adaptive --eta 3 --s-max 20 --rtc-execution-horizon 16
+#
 # Paper baselines (Pi0.5 PyTorch, best measured K):
 #   bash run_dynamic.sh pt_sync_k10  sync  10 0.147
 #   bash run_dynamic.sh pt_async_k6  async 6  0.147
@@ -53,7 +60,7 @@ echo "$(date '+%F %T') $NAME: strategy=$STRATEGY K=$K latency=$LATENCY speeds=${
 git -C "$HERE" log -1 --oneline
 for (( i = 0; i < SERVERS; i++ )); do
   (cd "$HERE/../libero_pro" && exec uv run --with websockets --with msgpack python "$HERE/policy_server.py" \
-     --port $((PORT + i)) "${SERVER_ARGS[@]}") > "$OUT/server_$i.log" 2>&1 &
+     --port $((PORT + i)) --log-jsonl "$OUT/signals_$i.jsonl" "${SERVER_ARGS[@]}") > "$OUT/server_$i.log" 2>&1 &
   pids+=($!)
 done
 for (( i = 0; i < SERVERS; i++ )); do  # wait until every server answers its metadata
@@ -97,7 +104,7 @@ PY
      --openpi-port "$PORT" --policy-server-count "$SERVERS" --per-worker-policy-endpoint \
      --latency-source fixed --calibrated-latency-seconds "$LATENCY" --replan-steps "$K" --max-steps 600 \
      --stop-on-success --no-save-videos --no-save-model-input-videos --no-save-step-trace --camera-size 256 \
-     "${extra[@]}") > "$OUT/eval_v$v.log" 2>&1 || { rc=1; echo "eval failed, see $OUT/eval_v$v.log"; tail -20 "$OUT/eval_v$v.log"; break; }
+     "${extra[@]}" ${RUNNER_ARGS:-}) > "$OUT/eval_v$v.log" 2>&1 || { rc=1; echo "eval failed, see $OUT/eval_v$v.log"; tail -20 "$OUT/eval_v$v.log"; break; }
   "$DPY" - "$OUT/v$v" <<'PY'
 import json, sys
 from pathlib import Path

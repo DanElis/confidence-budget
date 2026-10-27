@@ -58,3 +58,33 @@ def test_cli_checks():
     for bad in (["--n-samples", "4"], ["--select", "coherent"], ["--mode", "rtc", "--mask-mode", "rtc_x_conf"]):
         with pytest.raises(SystemExit):
             ps.parse_args(bad)
+
+
+def make_planner(**kw):
+    """Server with only what plan_step needs (no model)."""
+    from hstar import HStarRule
+
+    args = ps.parse_args(["--mode", "rtc", "--n-samples", "4", "--adaptive", *kw.pop("argv", [])])
+    srv = ps.Server.__new__(ps.Server)
+    srv.args, srv.horizon = args, 50
+    srv.rule = HStarRule("above", eta=args.eta, k=1, min_h=1)
+    return srv
+
+
+def test_plan_step_from_agreement():
+    srv = make_planner(argv=["--eta", "3", "--s-max", "20"])
+    z = np.zeros(50)
+    z[12:] = 5.0  # the old plan leaves the cloud at index 12
+    assert srv.plan_step(z, 4) == (12, 8)  # s = h* - d
+    assert srv.plan_step(np.zeros(50), 4) == (50, 20)  # always agrees: s_max
+    z2 = np.zeros(50)
+    z2[2:] = 5.0
+    assert srv.plan_step(z2, 4) == (2, 4)  # disagrees early: s_min = d
+    assert srv.plan_step(None, 4) == (50, 4)  # first chunk of an episode: s_min
+    srv2 = make_planner(argv=["--s-min", "6"])
+    assert srv2.plan_step(z2, 4)[1] == 6
+
+
+def test_adaptive_cli_checks():
+    with pytest.raises(SystemExit):
+        ps.parse_args(["--mode", "rtc", "--adaptive"])  # needs K > 1
