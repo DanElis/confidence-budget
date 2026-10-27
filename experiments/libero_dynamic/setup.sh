@@ -32,6 +32,9 @@ fi
 (cd "$DYN" && uv pip install --python .venv/bin/python --overrides "$HERE/overrides.txt" -r requirements.txt && uv pip install --python .venv/bin/python --overrides "$HERE/overrides.txt" -e .)
 uv pip install --python "$DYN/.venv/bin/python" -e "$OPENPI/packages/openpi-client"
 
+echo "== opt-in client patch (LIBERO_DYNAMIC_KEEP_CHUNK=1 keeps the whole returned chunk)"
+bash "$HERE/patch_runner.sh"
+
 echo "== preflight of the dynamic configs (no policy)"
 (cd "$DYN" && PYTHONPATH="$DYN:$DYN/scripts" LIBERO_CONFIG_PATH="$DYN/libero/libero/configs" MUJOCO_GL=egl \
   .venv/bin/python scripts/preflight_dynamic_configs.py) || echo "preflight reported problems (see above)"

@@ -12,10 +12,11 @@
 # PORT (8124), RUNS (runs). Full configuration: 3 speeds x 600 = 1800 episodes. Finished speeds are skipped.
 #
 # RUNNER_ARGS: extra arguments for the benchmark runner (e.g. "--prefetch-threshold 4" for the adaptive step).
+# KEEP_CHUNK=1: the client keeps the whole returned chunk instead of trimming it to K (patch_runner.sh).
 #
 # Adaptive step from plan agreement + confidence mask + coherent sample (RTC strategy of the runner; the server sets
 # the step through the chunk length s + d, the runner requests when d actions are left; K = s_min + d):
-#   RUNNER_ARGS="--prefetch-threshold 4" bash run_dynamic.sh ada rtc 8 0.175 --n-samples 4 --select coherent \
+#   KEEP_CHUNK=1 RUNNER_ARGS="--prefetch-threshold 4" bash run_dynamic.sh ada rtc 8 0.175 --n-samples 4 --select coherent \
 #     --mask-mode rtc_x_conf --conf-sigma 1 --conf-ref 0.03716 --adaptive --eta 3 --s-max 20 --rtc-execution-horizon 16
 #
 # Paper baselines (Pi0.5 PyTorch, best measured K):
@@ -46,6 +47,13 @@ DPY="$DYN/.venv/bin/python"
 export PYTHONPATH="$DYN:$DYN/scripts:$OPENPI/packages/openpi-client/src"
 export LIBERO_CONFIG_PATH="$DYN/libero/libero/configs" MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID=${GPU:-0}
 export LIBERO_DYNAMIC_AUTO_FINALIZE=false
+if [[ ${KEEP_CHUNK:-0} == 1 ]]; then
+  grep -q LIBERO_DYNAMIC_KEEP_CHUNK "$DYN/scripts/eval_dynamic_libero_style.py" \
+    || { echo "KEEP_CHUNK=1 needs the client patch: bash patch_runner.sh"; exit 1; }
+  export LIBERO_DYNAMIC_KEEP_CHUNK=1
+else
+  unset LIBERO_DYNAMIC_KEEP_CHUNK
+fi
 
 pids=()
 stop_servers() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; }
