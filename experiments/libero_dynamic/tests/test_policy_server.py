@@ -107,4 +107,4 @@ def test_plan_step_aac():
     srv = make_planner(argv=["--rule", "aac", "--s-max", "20"])
     disp = np.r_[np.full(10, 0.1), np.full(40, 1.0)]
     assert srv.plan_step(None, 4, disp) == (10, 6)  # works on the first chunk too: needs only the new samples
-    assert srv.plan_step(np.zeros(50), 4, np.full(50, 0.2))[1] == 4  # flat profile: h* = 1, s = s_min
+    assert srv.plan_step(np.zeros(50), 4, np.full(50, 0.25))[1] == 4  # flat (exact in binary): h* = 1, s = s_min
