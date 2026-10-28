@@ -41,6 +41,16 @@ for p in (HERE, LIBERO_PRO, LIBERO_PRO / "scripts", HERE.parent / "h1"):
 import eval_libero as EL  # noqa: E402  (planner, policy loading, summaries)
 from closed_loop import Chunk, LoopConfig, run_batch, sparc, stack_observations, switch_jumps  # noqa: E402
 from remote_env import RemoteEnv, SimulatorError, resolve_observations  # noqa: E402
+from selection import (  # noqa: E402
+    MASK_MODES,
+    SELECTS,
+    agreement,
+    conf_weights,
+    dispersion,
+    joint_batch,
+    select_index,
+    split_joint,
+)
 
 log = logging.getLogger("eval_robotwin")
 BATCH_ATTEMPTS = 3
@@ -86,8 +96,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--n-samples", type=int, default=1,
                    help="K > 1: generate K chunks per observation (different noise) and store their dispersion per "
                         "action index; the robot executes sample 0, which uses the same noise as a K = 1 run")
-    p.add_argument("--signal", choices=["entropy", "dispersion"], default="entropy",
-                   help="what the budget planner's h* rule reads (dispersion needs --n-samples > 1)")
+    p.add_argument("--signal", choices=["entropy", "dispersion", "agreement"], default="entropy",
+                   help="what the budget / adaptive planner's h* rule reads (dispersion, agreement need --n-samples > 1)")
+    # current idea (libero_pro/selection.py): K unguided + K guided rows in one call with a shared prefix
+    p.add_argument("--select", choices=SELECTS, default="first", help="executed sample: coherent = closest to the old plan")
+    p.add_argument("--mask-mode", choices=MASK_MODES, default="rtc", help="rtc_x_conf: RTC mask * exp(-D_old / sigma)")
+    p.add_argument("--conf-sigma", type=float, default=1.0)
+    p.add_argument("--conf-ref", type=float, default=1.0)
+    p.add_argument("--shared-prefix", action="store_true", help="encode each observation's prefix once for the K samples")
+    p.add_argument("--s-max", type=int, default=None, help="adaptive: largest step (default H - d)")
+    p.add_argument("--mask-r", type=int, default=None, help="adaptive: mask end d + r (default H - s)")
     p.add_argument("--record-plans", action="store_true", help="store each chunk's actions (policy space) for drift analysis")
     p.add_argument("--save-actions", action="store_true")
     p.add_argument("--seed", type=int, default=0)
@@ -109,6 +127,22 @@ def expand_noise(noise: torch.Tensor, k: int) -> torch.Tensor:
         g = torch.Generator().manual_seed(seed)
         out += [torch.randn(row.shape, generator=g, dtype=row.dtype) for _ in range(k - 1)]
     return torch.stack(out)
+
+
+def joint_mode(args) -> bool:
+    """The current idea's K-sample path (one call, unguided + guided rows) instead of the old one (K guided rows,
+    sample 0 executed, dispersion only logged; kept for run_samples.sh)."""
+    return args.n_samples > 1 and (args.select != "first" or args.mask_mode != "rtc" or args.signal == "agreement"
+                                   or args.shared_prefix)
+
+
+def check_args(args) -> None:
+    if args.signal in ("dispersion", "agreement") and args.n_samples < 2:
+        raise SystemExit(f"--signal {args.signal} needs --n-samples >= 2")
+    if joint_mode(args) and args.guidance == "none":
+        raise SystemExit("--select / --mask-mode / --signal agreement / --shared-prefix need guidance (they use the old plan)")
+    if args.select != "first" and args.n_samples < 2:
+        raise SystemExit("--select needs --n-samples >= 2")
 
 
 def episode_sparc(actions: np.ndarray) -> float:
@@ -174,15 +208,19 @@ def main() -> None:
         noise_shape = (horizon, int(policy.config.max_action_dim))
     if args.planner == "fixed" and args.stride is None:
         args.stride = n_action_steps
+    check_args(args)
     planner = EL.make_planner(args, horizon)
-    if args.signal == "dispersion" and args.n_samples < 2:
-        raise SystemExit("--signal dispersion needs --n-samples >= 2")
     recorder = None
+    rtc_proc = weights_proc = None
     if policy is not None:
         if args.guidance != "none":
+            from h1.guidance import BatchRTCProcessor
+
             default_end = horizon - (args.stride or 10)
-            install_batch_rtc(policy, args.guidance, make_rtc_config(args.schedule, args.max_guidance_weight, default_end))
-        if args.record_entropy or planner.needs_entropy:
+            rtc_config = make_rtc_config(args.schedule, args.max_guidance_weight, default_end)
+            rtc_proc = install_batch_rtc(policy, args.guidance, rtc_config)
+            weights_proc = BatchRTCProcessor(rtc_config, jacobian=False)
+        if args.record_entropy or (planner.needs_entropy and args.signal == "entropy"):
             from h1.attention import CrossAttentionRecorder
 
             recorder = CrossAttentionRecorder(policy.model).attach()
@@ -194,9 +232,60 @@ def main() -> None:
     (args.out / "config.json").write_text(json.dumps(meta, indent=2))
     log.info("H=%d d=%d guidance=%s planner=%s tasks=%s", horizon, args.delay, args.guidance, planner, tasks)
 
+    def infer_joint(observations, noise, leftover, delay, mask_end, leftover_disp, leftover_len, instruction) -> Chunk:
+        """K unguided + K guided rows in one call (shared prefix optional): dispersion, plan agreement z (the
+        planner's signal), choice of the executed sample, confidence-weighted RTC mask."""
+        from shared_prefix import predict_chunk_shared
+
+        n, k, dev = len(observations), args.n_samples, args.device
+
+        def predict_rows(repeats, noise_rows, **kw):
+            if args.shared_prefix:
+                batch = preprocessor(to_policy_batch(observations, instruction))
+                return predict_chunk_shared(policy, batch, repeats, noise=noise_rows.to(dev), **kw)
+            batch = preprocessor(to_policy_batch([o for o in observations for _ in range(repeats)], instruction))
+            return policy.predict_action_chunk(batch, noise=noise_rows.to(dev), **kw)
+
+        noise_k = expand_noise(noise, k)
+        sel, z = torch.zeros(n, dtype=torch.long), torch.zeros(n, horizon)
+        with torch.no_grad():
+            if leftover is None:  # first chunk of an episode
+                samples = predict_rows(k, noise_k).float().reshape(n, k, horizon, -1)
+                real = samples[..., :ACTION_DIM]
+                model = samples[:, 0]
+            else:
+                rtc_w = weights_proc.prefix_weights(delay, mask_end, n, horizon, horizon).to(dev)
+                w = conf_weights(args.mask_mode, rtc_w, None if leftover_disp is None else leftover_disp.to(dev),
+                                 delay, mask_end, args.conf_sigma * args.conf_ref)
+                noise2, left2, mask2, w2 = joint_batch(noise_k, leftover, mask_end, w, k)
+                rtc_proc.weight_override = w2.to(dev)
+                try:
+                    out = predict_rows(2 * k, noise2, inference_delay=delay, prev_chunk_left_over=left2.to(dev),
+                                       execution_horizon=mask2)
+                finally:
+                    rtc_proc.weight_override = None
+                unguided, guided = split_joint(out.float(), n, k)
+                real = unguided[..., :ACTION_DIM]
+                left = leftover[..., :ACTION_DIM].to(dev)
+                sel = select_index(args.select, real, left, w)
+                z = agreement(real, left, leftover_len)
+                model = guided[torch.arange(n, device=guided.device), sel.to(guided.device)]
+        disp = dispersion(real).cpu().numpy()
+        z_np = z.numpy()
+        actions = postprocessor(model.clone())
+        extras = {"dispersion": disp, "agree": z_np, "sel": sel.numpy()}
+        if args.record_plans:
+            extras["plan"] = model[:, :, :ACTION_DIM].cpu().numpy()
+        return Chunk(model, torch.as_tensor(actions).float().cpu().numpy(),
+                     signal=z_np if args.signal == "agreement" else (disp if args.signal == "dispersion" else None),
+                     dispersion=disp, extras=extras)
+
     def make_infer(instruction: str):
-        def infer(observations, noise, leftover, delay, mask_end) -> Chunk:
+        def infer(observations, noise, leftover, delay, mask_end, leftover_disp=None, leftover_len=None) -> Chunk:
             observations = resolve_observations(observations)  # render the due environments together
+            if policy is not None and joint_mode(args):
+                return infer_joint(observations, noise, leftover, delay, mask_end, leftover_disp, leftover_len,
+                                   instruction)
             if policy is None:  # hold position: tests the simulator side only
                 state = np.stack([np.asarray(o["agent_pos"], np.float32) for o in observations])
                 acts = np.repeat(state[:, None], horizon, axis=1)
@@ -204,9 +293,9 @@ def main() -> None:
                 extras = {"dispersion": np.tile(np.linspace(0.05, 0.5, horizon), (n, 1))} if args.n_samples > 1 else {}
                 if args.record_plans:
                     extras["plan"] = acts[..., :ACTION_DIM]
-                sig = extras.get("dispersion") if args.signal == "dispersion" else None
+                sig = extras.get("dispersion") if args.signal in ("dispersion", "agreement") else None
                 return Chunk(torch.as_tensor(acts), acts, np.full((n, horizon), 3.0), np.full(n, 100),
-                             signal=sig, extras=extras)
+                             signal=sig, extras=extras, dispersion=extras.get("dispersion") if joint_mode(args) else None)
             k = args.n_samples
             n = len(observations)
             if k > 1:  # K chunks per observation with different noise; sample 0 keeps the episode's noise

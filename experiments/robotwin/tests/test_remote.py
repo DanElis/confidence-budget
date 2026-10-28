@@ -197,3 +197,36 @@ def test_expand_noise_keeps_sample_zero_and_is_deterministic():
     a, b = expand_noise(base, 4), expand_noise(base, 4)
     assert a.shape == (12, 50, 32) and torch.equal(a, b)
     assert torch.equal(a[::4], base) and not torch.equal(a[1], a[2])
+
+
+FULL_IDEA = ["--n-samples", "4", "--select", "coherent", "--mask-mode", "rtc_x_conf", "--conf-sigma", "1",
+             "--conf-ref", "0.04", "--shared-prefix", "--signal", "agreement", "--planner", "adaptive",
+             "--hstar-rule", "kind=above,eta=0.2,k=1,min_h=1", "--s-min", "6", "--s-max", "30", "--mask-r", "5",
+             "--guidance", "lerobot"]
+
+
+def test_full_idea_runs_end_to_end_fake(tmp_path):
+    """Adaptive step from the planner signal, with the fake policy's dispersion profile (0.05 -> 0.5 over H) as signal:
+    h* = first index above 0.2 = 17, so s = h* - d = 13 on every chunk after the first."""
+    out = tmp_path / "run"
+    cmd = [a for a in _eval_cmd(out) if a not in ("--stride", "10")] + FULL_IDEA
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stderr[-3000:]
+    res = json.loads((out / "lift_pot.json").read_text())
+    assert res["n_episodes"] == 6
+    chunks = json.loads((out / "lift_pot_chunks.json").read_text())
+    assert {c["stride"] for c in chunks} == {13} and {c["h_star"] for c in chunks} == {17}
+    assert len(chunks[0]["dispersion"]) == 50
+
+
+def test_full_idea_needs_guidance():
+    sys.path.insert(0, str(HERE / "scripts"))
+    import pytest
+    from eval_robotwin import check_args, parse_args
+
+    check_args(parse_args(["--out", "x", *FULL_IDEA]))
+    no_guidance = [a for a in FULL_IDEA if a not in ("--guidance", "lerobot")]
+    with pytest.raises(SystemExit):
+        check_args(parse_args(["--out", "x", *no_guidance]))
+    with pytest.raises(SystemExit):
+        check_args(parse_args(["--out", "x", "--signal", "agreement", "--guidance", "lerobot"]))  # K = 1
