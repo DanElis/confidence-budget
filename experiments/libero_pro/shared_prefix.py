@@ -8,7 +8,9 @@ and pad mask are repeated ``repeats`` times along the batch (row i*repeats + j =
 only the expert runs per sample. RTC kwargs (leftover, mask end) must already be given per output row.
 
 ``sample_actions_shared`` is sample_actions of the pinned version with the expansion inserted after the prefix
-pass; ``predict_chunk_shared`` is predict_action_chunk around it. Only guided / no RTC is supported (not the
+pass; ``predict_chunk_shared`` is predict_action_chunk around it. ``before_integrate(velocity)`` is called once
+before the denoising loop with ``velocity(x_t, time)`` of the cached prefix (an extra expert pass, e.g. to set
+the RTC weights from a check of the old plan under this observation). Only guided / no RTC is supported (not the
 "trained" RTC mode).
 """
 
@@ -29,7 +31,8 @@ def expand_cache(past_key_values, repeats: int):
 
 
 def sample_actions_shared(model, repeats: int, images, img_masks, tokens, masks, states=None, state_masks=None,
-                          noise: Tensor | None = None, num_steps: int | None = None, **kwargs) -> Tensor:
+                          noise: Tensor | None = None, num_steps: int | None = None, before_integrate=None,
+                          **kwargs) -> Tensor:
     from lerobot.policies.common.flow_matching import euler_integrate
     from lerobot.policies.common.vla_utils import make_att_2d_masks
 
@@ -55,6 +58,10 @@ def sample_actions_shared(model, repeats: int, images, img_masks, tokens, masks,
     # the only change: every observation's prefix serves `repeats` samples
     past_key_values = expand_cache(past_key_values, repeats)
     prefix_pad_masks = prefix_pad_masks.repeat_interleave(repeats, 0)
+
+    if before_integrate is not None:
+        before_integrate(lambda x_t, time: model.denoise_step(
+            prefix_pad_masks=prefix_pad_masks, past_key_values=past_key_values, x_t=x_t, timestep=time))
 
     rtc_on = model._rtc_enabled()  # noqa: SLF001
     if rtc_on and model.rtc_processor.rtc_config.mode != "guided":

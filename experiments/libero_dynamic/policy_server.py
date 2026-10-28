@@ -14,7 +14,12 @@ Differences from their server, all opt-in except the noise:
 * noise is deterministic per request (hash of state, prompt, leftover length and --seed), so configurations
   share it while their trajectories coincide (paired comparisons);
 * --n-samples K > 1 (RTC only): K unguided + K guided rows in one call with a shared prefix
-  (libero_pro/selection.py, shared_prefix.py): --select coherent|medoid, --mask-mode rtc_x_conf|conf.
+  (libero_pro/selection.py, shared_prefix.py): --select coherent|medoid, --mask-mode rtc_x_conf|conf;
+* --mask-mode transition (RTC, one sample): before denoising, the old plan is checked under the new observation
+  (one extra expert pass on the cached prefix, selection.plan_residual) and the RTC mask becomes an exponential
+  transition whose length grows with the old plan's deviation near the stitch (selection.transition_weights):
+  a far-off new plan is blended in slowly, a near one quickly. --trans-power 0 is the constant-length control.
+  The old plan is the full chunk kept on the server (the client's leftover is only the returned part).
 
     uv run --project ../libero_pro --with websockets --with msgpack python policy_server.py --port 8124 --mode rtc
 """
@@ -45,6 +50,8 @@ from selection import (  # noqa: E402
     SELECTS,
     agreement,
     conf_weights,
+    plan_residual,
+    transition_weights,
     dispersion,
     expand_noise,
     joint_batch,
@@ -150,7 +157,10 @@ class Server:
                 "rtc_conditioning_supported": a.mode == "rtc", "rtc_execution_horizon": self.exec_h,
                 "n_samples": a.n_samples, "select": a.select, "mask_mode": a.mask_mode,
                 "conf_sigma": a.conf_sigma, "conf_ref": a.conf_ref, "seed": a.seed, "adaptive": a.adaptive,
-                "rule": a.rule, "eta": a.eta, "aac_min_h": a.aac_min_h, "s_min": a.s_min, "s_max": a.s_max}
+                "rule": a.rule, "eta": a.eta, "aac_min_h": a.aac_min_h, "s_min": a.s_min, "s_max": a.s_max,
+                "trans_len": a.trans_len, "trans_ref": a.trans_ref, "trans_power": a.trans_power,
+                "trans_min": a.trans_min, "trans_max": a.trans_max, "trans_window": a.trans_window,
+                "fresh_t": a.fresh_t}
 
     def batch(self, obs: dict) -> dict:
         return self.pre({"observation.images.image": as_image(obs["observation/image"]),
@@ -167,7 +177,9 @@ class Server:
         mask_end = torch.tensor([self.exec_h])
         plan: dict[str, Any] = {"sel": 0}
         with torch.no_grad():
-            if a.n_samples == 1:
+            if a.mask_mode == "transition":
+                chunk, plan = self.infer_transition(batch, noise, left, left_len, delay, mask_end, state)
+            elif a.n_samples == 1:
                 kw = {} if left is None else dict(inference_delay=delay, prev_chunk_left_over=left.to(dev),
                                                    execution_horizon=mask_end)
                 chunk = self.policy.predict_action_chunk(batch, noise=noise.to(dev), **kw).float()
@@ -179,6 +191,53 @@ class Server:
         return {"actions": actions[0].detach().cpu().numpy().astype(np.float32), "original_actions": original,
                 "plan": plan}
 
+    def old_plan(self, left, left_len, state):
+        """The client's leftover is the unconsumed tail of the chunk we returned (length state["len"]); the old plan
+        beyond it is in the full chunk kept here. -> (leftover (1, H, A) padded, its length, start in the full chunk)"""
+        start = max(self.apc - left_len, 0)
+        if left is None or "full" not in state:
+            return left, left_len, start
+        start = max(int(state["len"]) - left_len, 0)
+        rest = state["full"][start:]
+        out = torch.zeros(1, self.horizon, rest.shape[-1])
+        out[0, : len(rest)] = rest.cpu()
+        return out, len(rest), start
+
+    def infer_transition(self, batch, noise, left, left_len, delay, mask_end, state):
+        """RTC with the transition mask: check of the old plan under this observation, then guided denoising."""
+        from shared_prefix import predict_chunk_shared
+
+        a, dev = self.args, self.args.device
+        left, left_len, _ = self.old_plan(left, left_len, state)
+        plan: dict[str, Any] = {"sel": 0, "len": self.apc}
+        if left is None:
+            chunk = predict_chunk_shared(self.policy, batch, 1, noise=noise.to(dev)).float()
+        else:
+            info: dict[str, Any] = {}
+
+            def set_weights(velocity):
+                r = plan_residual(velocity, left[..., :ACTION_DIM].to(dev), noise.to(dev), a.fresh_t)[0].cpu()
+                w, length, delta = transition_weights(r, delay, left_len, self.horizon, a.trans_len, a.trans_ref,
+                                                      a.trans_power, a.trans_min, a.trans_max, a.trans_window)
+                self.rtc.weight_override = w[None].to(dev)
+                info.update(r=r[:left_len].numpy(), L=length, delta=delta)
+
+            try:
+                chunk = predict_chunk_shared(self.policy, batch, 1, noise=noise.to(dev), inference_delay=delay,
+                                             prev_chunk_left_over=left.to(dev), execution_horizon=mask_end,
+                                             before_integrate=set_weights).float()
+            finally:
+                self.rtc.weight_override = None
+            plan.update(L=round(info["L"], 3), delta=None if np.isnan(info["delta"]) else round(info["delta"], 5))
+            if self.log is not None:
+                self.log.write(json.dumps({"prompt": state.get("prompt"), "req": state.get("req"), "delay": delay,
+                                           "left_len": left_len, **plan,
+                                           "r": np.round(info["r"], 5).tolist()}) + "
+")
+                self.log.flush()
+        state.update(full=chunk[0].detach().cpu(), len=self.apc)
+        return chunk, plan
+
     def infer_samples(self, batch, noise, left, left_len, delay, mask_end, state):
         """K samples in one call. With --adaptive also the replanning step from the agreement of the old plan with
         the new samples; the step is realised through the length of the returned chunk (s + d, see plan_step)."""
@@ -187,14 +246,8 @@ class Server:
         a, dev, k = self.args, self.args.device, self.args.n_samples
         noise_k = expand_noise(noise, k)
         disp_start = max(self.apc - left_len, 0)
-        if a.adaptive and left is not None and "full" in state:
-            # the client's leftover is the unconsumed tail of what we returned (len = s + d); the old plan beyond it
-            # (needed by the soft mask and the agreement) is in the full chunk kept here
-            disp_start = max(int(state["len"]) - left_len, 0)
-            rest = state["full"][disp_start:]
-            left = torch.zeros(1, self.horizon, rest.shape[-1])
-            left[0, : len(rest)] = rest.cpu()
-            left_len = len(rest)
+        if a.adaptive:  # the old plan beyond the returned s + d actions (soft mask, agreement)
+            left, left_len, disp_start = self.old_plan(left, left_len, state)
         z = None
         if left is None:  # first chunk of an episode: K unguided samples, sample 0 executed
             samples = predict_chunk_shared(self.policy, batch, k, noise=noise_k.to(dev)).float().reshape(1, k, self.horizon, -1)
@@ -310,7 +363,7 @@ def parse_args(argv=None):
     p.add_argument("--schedule", default="exp")
     p.add_argument("--n-samples", type=int, default=1)
     p.add_argument("--select", choices=SELECTS, default="first")
-    p.add_argument("--mask-mode", choices=MASK_MODES, default="rtc")
+    p.add_argument("--mask-mode", choices=(*MASK_MODES, "transition"), default="rtc")
     p.add_argument("--conf-sigma", type=float, default=1.0)
     p.add_argument("--conf-ref", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0)
@@ -322,13 +375,28 @@ def parse_args(argv=None):
     p.add_argument("--aac-min-h", type=int, default=1, help="adaptive, aac: lower bound of h*")
     p.add_argument("--s-min", type=int, default=None, help="adaptive: lower bound of s (default d)")
     p.add_argument("--s-max", type=int, default=20, help="adaptive: upper bound of s")
+    p.add_argument("--trans-len", type=float, default=6.0,
+                   help="transition: L0, the transition length at delta = --trans-ref")
+    p.add_argument("--trans-ref", type=float, default=1.0,
+                   help="transition: reference deviation (median delta of a --trans-power 0 run, report_dynamic.py 'plan')")
+    p.add_argument("--trans-power", type=float, default=1.0, help="transition: L ~ delta^p; 0 = constant L0")
+    p.add_argument("--trans-min", type=float, default=1.0, help="transition: lower bound of L")
+    p.add_argument("--trans-max", type=float, default=30.0, help="transition: upper bound of L")
+    p.add_argument("--trans-window", type=int, default=5,
+                   help="transition: delta = RMS residual of the old plan over [d, d + window)")
+    p.add_argument("--fresh-t", type=float, default=0.5,
+                   help="transition: flow time of the old-plan check (LeRobot: 1 = noise, 0 = clean)")
     p.add_argument("--log-jsonl", default=None, help="append per-request signals (z, dispersion, plan) here")
     args = p.parse_args(argv)
     if args.adaptive and args.n_samples < 2:
         p.error("--adaptive needs --n-samples > 1 and --mode rtc")
     if args.n_samples > 1 and args.mode != "rtc":
         p.error("--n-samples > 1 needs --mode rtc (selection and the mask use the old plan)")
-    if args.n_samples == 1 and (args.select != "first" or args.mask_mode != "rtc"):
+    if args.mask_mode == "transition" and (args.mode != "rtc" or args.n_samples != 1 or args.adaptive):
+        p.error("--mask-mode transition needs --mode rtc and one sample")
+    if not 0 < args.fresh_t < 1:
+        p.error("--fresh-t must be in (0, 1)")
+    if args.n_samples == 1 and (args.select != "first" or args.mask_mode not in ("rtc", "transition")):
         p.error("--select / --mask-mode need --n-samples > 1")
     return args
 

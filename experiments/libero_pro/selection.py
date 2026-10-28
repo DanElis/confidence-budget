@@ -10,6 +10,13 @@ All functions work on the policy's normalised action space and only the real act
 * ``agreement``     - per index, how far the old leftover lies from the cloud of new samples:
   z_i = mean over action dims of |leftover - mean| / std, 0 where the old plan has ended. With the ``above`` h* rule
   (eta = z threshold) h* is the first index where the policy no longer supports the old plan.
+* ``plan_residual`` - fresh-frame check of the old plan: noise it to flow time t, x_t = t*eps + (1-t)*Y (LeRobot's
+  convention, noise at t = 1), take one velocity of the policy under the NEW observation and compare the denoised
+  estimate x_t - t*v with Y per index. Small = the policy would still produce the old plan.
+* ``transition_weights`` - RTC mask with an exponential transition of length L that grows with the deviation of the
+  old plan near the stitch: W_j = 1 (j < d), exp(-(j - d) / L) (d <= j < leftover end), 0 after;
+  L = clip(L0 * (delta / delta_ref)^p, L_min, L_max), delta = sqrt(mean residual over [d, d + window)). p = 0 is a
+  constant L0 (the paired control).
 * ``expand_noise``  - (B, H, A) -> (B*K, H, A); row 0 of each group is the episode's noise, the others are drawn
   deterministically from it (as experiments/robotwin), so every configuration sees the same samples.
 """
@@ -98,3 +105,33 @@ def agreement(samples: torch.Tensor, leftover: torch.Tensor | None, leftover_len
     z = ((leftover.to(samples) - mean).abs() / (std + eps)).mean(-1)  # (B, H)
     valid = torch.arange(h, device=z.device)[None] < leftover_len.to(z.device)[:, None]
     return torch.where(valid, z, torch.zeros_like(z)).cpu()
+
+
+def plan_residual(velocity_fn, leftover: torch.Tensor, noise: torch.Tensor, t: float) -> torch.Tensor:
+    """leftover (R, H, A) old plan, noise (R, H, A_max), velocity_fn(x_t, time (R,)) -> (R, H, A_max) under the new
+    observation -> r (R, H): mean squared error of the denoised estimate over the A real dimensions."""
+    a = leftover.shape[-1]
+    y = torch.zeros_like(noise)
+    y[..., :a] = leftover.to(noise)
+    x_t = t * noise + (1 - t) * y
+    v = velocity_fn(x_t, torch.full((noise.shape[0],), t, dtype=torch.float32, device=noise.device))
+    est = x_t - t * v.to(x_t)
+    return ((est[..., :a] - y[..., :a]) ** 2).mean(-1).float()
+
+
+def transition_weights(residual, delay: int, leftover_len: int, horizon: int, l0: float, delta_ref: float = 1.0,
+                       power: float = 1.0, l_min: float = 1.0, l_max: float = 50.0, window: int = 5):
+    """residual (H,) of the old plan -> (weights (H,), L, delta); delta is nan when no leftover action follows the
+    frozen part (then L = L0, and the weights after it are 0 anyway)."""
+    r = torch.as_tensor(residual, dtype=torch.float64)
+    near = r[delay: min(delay + window, leftover_len)]
+    delta = float(near.mean().sqrt()) if len(near) else float("nan")
+    if power == 0 or not len(near):
+        length = float(l0)
+    else:
+        length = float(l0 * (max(delta, 1e-12) / delta_ref) ** power)
+    length = min(max(length, l_min), l_max)
+    j = torch.arange(horizon, dtype=torch.float64)
+    w = torch.where(j < delay, torch.ones_like(j), torch.exp(-(j - delay) / length))
+    w[j >= max(leftover_len, delay)] = 0.0
+    return w.float(), length, delta

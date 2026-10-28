@@ -108,3 +108,99 @@ def test_plan_step_aac():
     disp = np.r_[np.full(10, 0.1), np.full(40, 1.0)]
     assert srv.plan_step(None, 4, disp) == (10, 6)  # works on the first chunk too: needs only the new samples
     assert srv.plan_step(np.zeros(50), 4, np.full(50, 0.25))[1] == 4  # flat (exact in binary): h* = 1, s = s_min
+
+
+# ---------------------------------------------------------------- transition mask
+
+from selection import plan_residual, transition_weights  # noqa: E402
+
+
+def wants(target):
+    """Velocity of a policy that denoises everything to ``target``: x_t - t * v = target."""
+    return lambda x_t, time: (x_t - target) / time[:, None, None]
+
+
+def test_plan_residual_is_zero_for_the_wanted_plan_and_grows_with_the_deviation():
+    torch.manual_seed(0)
+    noise, plan = torch.randn(1, 50, 32), torch.randn(1, 50, 7)
+    target = torch.zeros(1, 50, 32)
+    target[..., :7] = plan
+    torch.testing.assert_close(plan_residual(wants(target), plan, noise, 0.5), torch.zeros(1, 50))
+    target[0, 20:, :7] += 0.5  # the new frame wants something else from index 20 on
+    r = plan_residual(wants(target), plan, noise, 0.5)
+    assert float(r[0, :20].abs().max()) < 1e-10
+    torch.testing.assert_close(r[0, 20:], torch.full((30,), 0.25))
+    target[0, :, 7:] = 3.0  # padded dimensions are ignored
+    torch.testing.assert_close(plan_residual(wants(target), plan, noise, 0.5)[0, 20:], torch.full((30,), 0.25))
+
+
+def test_transition_weights_shape_and_length():
+    r = torch.zeros(50)
+    r[4:9] = 0.04  # delta = 0.2 near the stitch (d = 4, window 5)
+    w, length, delta = transition_weights(r, 4, 30, 50, l0=6, delta_ref=0.1, power=1)
+    assert delta == pytest.approx(0.2) and length == pytest.approx(12)  # twice the reference: twice as long
+    assert torch.all(w[:4] == 1) and float(w[4]) == 1.0
+    torch.testing.assert_close(w[4:30], torch.exp(-torch.arange(26.0) / 12))
+    assert torch.all(w[30:] == 0)  # no old plan beyond the leftover
+    assert transition_weights(r, 4, 30, 50, l0=6, delta_ref=0.4, power=1)[1] == pytest.approx(3)  # closer: shorter
+    assert transition_weights(r, 4, 30, 50, l0=6, delta_ref=0.1, power=0)[1] == 6  # control: constant
+    assert transition_weights(r, 4, 30, 50, l0=6, delta_ref=1e-6, power=1, l_max=20)[1] == 20
+    assert transition_weights(r * 0, 4, 30, 50, l0=6, delta_ref=0.1, power=1, l_min=1)[1] == 1
+    w, length, delta = transition_weights(r, 4, 3, 50, l0=6)  # leftover ends inside the frozen part
+    assert np.isnan(delta) and length == 6 and torch.all(w[4:] == 0) and torch.all(w[:4] == 1)
+
+
+class FakeRTC:
+    weight_override = None
+
+
+def make_transition_server(monkeypatch, argv=()):
+    import shared_prefix
+
+    args = ps.parse_args(["--mode", "rtc", "--mask-mode", "transition", "--device", "cpu", *argv])
+    srv = ps.Server.__new__(ps.Server)
+    srv.args, srv.horizon, srv.a_max, srv.apc, srv.exec_h = args, 50, 32, 10, 10
+    srv.policy, srv.rtc, srv.log = None, FakeRTC(), None
+    calls = []
+
+    def fake_predict(policy, batch, repeats, noise, before_integrate=None, **kw):
+        new = torch.zeros(1, 50, 32)
+        new[0, :, :7] = batch["want"]
+        if before_integrate is not None:
+            before_integrate(wants(new))
+        calls.append(dict(kw, weights=None if srv.rtc.weight_override is None else srv.rtc.weight_override.clone()))
+        return batch["want"][None].clone()
+
+    monkeypatch.setattr(shared_prefix, "predict_chunk_shared", fake_predict)
+    return srv, calls
+
+
+def test_transition_uses_the_kept_plan_and_lengthens_for_a_far_new_plan(monkeypatch):
+    srv, calls = make_transition_server(monkeypatch, ["--trans-len", "6", "--trans-ref", "0.1"])
+    state = {}
+    first = torch.zeros(50, 7)
+    chunk, plan = srv.infer_transition({"want": first}, torch.randn(1, 50, 32), None, 0, 4, torch.tensor([10]), state)
+    assert plan == {"sel": 0, "len": 10} and calls[-1]["weights"] is None and torch.equal(state["full"], first)
+    # the client executed 7 of the 10 returned actions; its leftover is the last 3, the old plan is full[7:]
+    left, left_len = ps.leftover_tensor({"prev_chunk_left_over": first[7:10].numpy()}, 50)
+    near = torch.zeros(50, 7)
+    _, p_near = srv.infer_transition({"want": near}, torch.randn(1, 50, 32), left, left_len, 4, torch.tensor([10]),
+                                     dict(state))
+    assert calls[-1]["prev_chunk_left_over"].shape == (1, 50, 7)
+    w = calls[-1]["weights"][0]
+    assert torch.all(w[:4] == 1) and torch.all(w[43:] == 0) and float(w[42]) > 0  # 43 actions of old plan
+    assert p_near["L"] == 1.0 and p_near["delta"] == 0  # the new frame agrees: shortest transition
+    far = torch.zeros(50, 7)
+    far[:, 0] = 0.2 * np.sqrt(7)  # RMS deviation 0.2 = twice the reference
+    _, p_far = srv.infer_transition({"want": far}, torch.randn(1, 50, 32), left, left_len, 4, torch.tensor([10]),
+                                    dict(state))
+    assert p_far["delta"] == pytest.approx(0.2, rel=1e-4) and p_far["L"] == pytest.approx(12, rel=1e-3)
+    assert srv.rtc.weight_override is None
+
+
+def test_transition_cli_checks():
+    ps.parse_args(["--mode", "rtc", "--mask-mode", "transition", "--trans-power", "0"])
+    for bad in (["--mask-mode", "transition"], ["--mode", "rtc", "--mask-mode", "transition", "--n-samples", "4"],
+                ["--mode", "rtc", "--mask-mode", "transition", "--fresh-t", "1"]):
+        with pytest.raises(SystemExit):
+            ps.parse_args(bad)
