@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # RTC transition mask on LIBERO-Dynamic as a pair: first the constant transition length L0 (control), then the length
-# growing with the old plan's deviation, scaled by the control's median deviation (logged signals only, no outcomes),
-# then the paired report. From experiments/libero_dynamic:
+# growing with the old plan's deviation, L = L0 * delta / REF with REF = the control's MEAN deviation (logged signals
+# only, no outcomes), so that the mean length stays near L0 (the deviation is right-skewed: with the median the mean L
+# came out ~1.4 * L0 in the smoke run); then the paired report. From experiments/libero_dynamic:
 #
 #   tmux new -d -s trans "SPEEDS=0.06 bash run_transition_pair.sh 2>&1 | tee runs/transition_pair.log"
 #
@@ -33,10 +34,10 @@ for f in Path(sys.argv[1]).glob("signals_*.jsonl"):
     for line in f.read_text().splitlines():
         if line.strip() and json.loads(line).get("delta") is not None:
             deltas.append(json.loads(line)["delta"])
-print(f"{statistics.median(deltas):.6g}" if deltas else "")
+print(f"{statistics.mean(deltas):.6g}" if deltas else "")
 PY
 )}
 [[ -n $REF ]] || { echo "no deviations logged in $RUNS/$CTRL/signals_*.jsonl"; exit 1; }
-echo "$(date '+%F %T') --trans-ref $REF (median deviation of $CTRL)"
+echo "$(date '+%F %T') --trans-ref $REF (mean deviation of $CTRL)"
 bash run_dynamic.sh "$ADA" rtc "$K" "$LATENCY" "${COMMON[@]}" --trans-power 1 --trans-ref "$REF" || exit 1
 python3 report_dynamic.py "$RUNS/$CTRL" "$RUNS/$ADA" --ref "$RUNS/$CTRL" --speeds $SPEEDS

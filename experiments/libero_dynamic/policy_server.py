@@ -377,7 +377,7 @@ def parse_args(argv=None):
     p.add_argument("--trans-len", type=float, default=6.0,
                    help="transition: L0, the transition length at delta = --trans-ref")
     p.add_argument("--trans-ref", type=float, default=1.0,
-                   help="transition: reference deviation (median delta of a --trans-power 0 run, report_dynamic.py 'plan')")
+                   help="transition: reference deviation (mean delta of a --trans-power 0 run, report_dynamic.py 'plan')")
     p.add_argument("--trans-power", type=float, default=1.0, help="transition: L ~ delta^p; 0 = constant L0")
     p.add_argument("--trans-min", type=float, default=1.0, help="transition: lower bound of L")
     p.add_argument("--trans-max", type=float, default=30.0, help="transition: upper bound of L")

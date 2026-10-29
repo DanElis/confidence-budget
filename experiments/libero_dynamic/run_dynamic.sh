@@ -20,7 +20,8 @@
 #     --mask-mode rtc_x_conf --conf-sigma 1 --conf-ref 0.03716 --adaptive --eta 3 --s-max 20 --rtc-execution-horizon 16
 #
 # RTC with a transition whose length grows with the deviation of the old plan under the new frame (one sample;
-# first the constant-length control, its median deviation "Δ med" from report_dynamic.py is --trans-ref):
+# first the constant-length control, its mean deviation "Δ mean" from report_dynamic.py is --trans-ref;
+# run_transition_pair.sh does both):
 #   bash run_dynamic.sh trans_c6 rtc 10 0.175 --mask-mode transition --trans-len 6 --trans-power 0
 #   bash run_dynamic.sh trans_a6 rtc 10 0.175 --mask-mode transition --trans-len 6 --trans-power 1 --trans-ref REF
 #

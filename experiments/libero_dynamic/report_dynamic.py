@@ -6,7 +6,7 @@
 Per run: success per speed and overall, paired Δ to the reference with a 95% bootstrap CI over common episodes,
 policy requests per episode, action change between steps (from the runner's action metrics), and for runs of our
 server the plan statistics from signals_*.jsonl (mean s, h*, share of chunks from a sample other than 0; with
---mask-mode transition the mean transition length L and the median deviation of the old plan).
+--mask-mode transition the mean transition length L and the mean and median deviation of the old plan).
 Standard library only (runs with any python3).
 """
 
@@ -57,10 +57,10 @@ def load(run: Path, speeds) -> dict:
 def plan_stats(run: Path) -> str:
     rows = [json.loads(l) for f in run.glob("signals_*.jsonl") for l in f.read_text().splitlines() if l.strip()]
     trans = [r for r in rows if "L" in r]
-    if trans:  # --mask-mode transition: mean transition length, median deviation (= --trans-ref of a constant run)
+    if trans:  # --mask-mode transition: mean transition length, mean (= --trans-ref of a constant run) and median deviation
         deltas = [r["delta"] for r in trans if r.get("delta") is not None]
-        med = f", Δ med {statistics.median(deltas):.4g}" if deltas else ""
-        return f"L {statistics.mean(r['L'] for r in trans):.2f}{med}"
+        dev = f", Δ mean {statistics.mean(deltas):.4g}, med {statistics.median(deltas):.4g}" if deltas else ""
+        return f"L {statistics.mean(r['L'] for r in trans):.2f}{dev}"
     rows = [r for r in rows if r.get("z") is not None]
     if not rows:
         return "—"
