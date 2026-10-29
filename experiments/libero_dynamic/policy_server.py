@@ -232,8 +232,7 @@ class Server:
             if self.log is not None:
                 self.log.write(json.dumps({"prompt": state.get("prompt"), "req": state.get("req"), "delay": delay,
                                            "left_len": left_len, **plan,
-                                           "r": np.round(info["r"], 5).tolist()}) + "
-")
+                                           "r": np.round(info["r"], 5).tolist()}) + "\n")
                 self.log.flush()
         state.update(full=chunk[0].detach().cpu(), len=self.apc)
         return chunk, plan
