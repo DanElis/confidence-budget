@@ -42,6 +42,7 @@ SERVERS=${SERVERS:-4}
 WORKERS=${WORKERS:-8}
 PORT=${PORT:-8124}
 RUNS=${RUNS:-$HERE/runs}
+mkdir -p "$RUNS" && RUNS="$(cd "$RUNS" && pwd)"  # absolute: the server and the runner start in other directories
 OUT="$RUNS/$NAME"
 mkdir -p "$OUT"
 [[ $STRATEGY == rtc ]] && SERVER_ARGS=(--mode rtc "${SERVER_ARGS[@]}")

@@ -11,8 +11,10 @@
 # Finished speeds are skipped by run_dynamic.sh, so the script can be restarted.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNS=${RUNS:-$HERE/runs}
+mkdir -p "$RUNS" && RUNS="$(cd "$RUNS" && pwd)"  # absolute before the cd below (a relative RUNS is from the caller)
+export RUNS
 cd "$HERE"
-export RUNS=${RUNS:-$HERE/runs}
 L0=${L0:-6} BETA=${BETA:-2} K=${K:-10} LATENCY=${LATENCY:-0.175}
 export SPEEDS=${SPEEDS:-"0.03 0.06 0.09"}
 CTRL=trans_c${L0}_b$BETA
