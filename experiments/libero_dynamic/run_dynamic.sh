@@ -25,6 +25,12 @@
 #   bash run_dynamic.sh trans_c6 rtc 10 0.175 --mask-mode transition --trans-len 6 --trans-power 0
 #   bash run_dynamic.sh trans_a6 rtc 10 0.175 --mask-mode transition --trans-len 6 --trans-power 1 --trans-ref REF
 #
+# Correction head (correction/): CORR_HEAD=path/best.pt starts CORR_SERVERS (default SERVERS) correction servers on
+# ports CORR_PORT.. (default PORT + 100); the strategy is selected through the runner, the policy server must return
+# the latent; CORR_* variables of correction/corrected_rtc_queue.py pass through:
+#   CORR_HEAD=heads/main/best.pt RUNNER_ARGS="--control-mode corrected_rtc_queue" bash run_dynamic.sh c2 rtc 10 0.175 \
+#     --max-guidance-weight 2 --rtc-execution-horizon 6 --return-latent
+#
 # Paper baselines (Pi0.5 PyTorch, best measured K):
 #   bash run_dynamic.sh pt_sync_k10  sync  10 0.147
 #   bash run_dynamic.sh pt_async_k6  async 6  0.147
@@ -78,13 +84,27 @@ for (( i = 0; i < SERVERS; i++ )); do
      --port $((PORT + i)) --log-jsonl "$OUT/signals_$i.jsonl" "${SERVER_ARGS[@]}") > "$OUT/server_$i.log" 2>&1 &
   pids+=($!)
 done
-for (( i = 0; i < SERVERS; i++ )); do  # wait until every server answers its metadata
-  until "$DPY" -c "from websockets.sync.client import connect; connect('ws://127.0.0.1:$((PORT + i))', open_timeout=1).close()" 2>/dev/null; do
-    kill -0 "${pids[$i]}" 2>/dev/null || { echo "server $i died, see $OUT/server_$i.log"; tail -20 "$OUT/server_$i.log"; stop_servers; exit 1; }
+ports=()
+for (( i = 0; i < SERVERS; i++ )); do ports+=($((PORT + i))); done
+if [[ -n ${CORR_HEAD:-} ]]; then
+  CORR_HEAD="$(realpath "$CORR_HEAD")"  # the servers start in libero_pro
+  [[ -f $CORR_HEAD ]] || { echo "no head checkpoint $CORR_HEAD"; exit 1; }
+  export CORR_PORT=${CORR_PORT:-$((PORT + 100))} CORR_SERVERS=${CORR_SERVERS:-$SERVERS}
+  for (( i = 0; i < CORR_SERVERS; i++ )); do
+    (cd "$HERE/../libero_pro" && exec uv run --with websockets --with msgpack python "$HERE/correction/correction_server.py" \
+       --head "$CORR_HEAD" --port $((CORR_PORT + i))) > "$OUT/corr_server_$i.log" 2>&1 &
+    pids+=($!)
+    ports+=($((CORR_PORT + i)))
+  done
+  echo "correction head $CORR_HEAD on ports $CORR_PORT.. ($CORR_SERVERS); $(env | grep '^CORR_' | tr '\n' ' ')"
+fi
+for (( i = 0; i < ${#ports[@]}; i++ )); do  # wait until every server answers its metadata
+  until "$DPY" -c "from websockets.sync.client import connect; connect('ws://127.0.0.1:${ports[$i]}', open_timeout=1).close()" 2>/dev/null; do
+    kill -0 "${pids[$i]}" 2>/dev/null || { echo "server on port ${ports[$i]} died, see $OUT/*server_*.log"; tail -20 "$OUT"/*server_*.log; stop_servers; exit 1; }
     sleep 5
   done
 done
-echo "$(date '+%F %T') $SERVERS policy server(s) up"
+echo "$(date '+%F %T') ${#ports[@]} server(s) up"
 
 rc=0
 for v in "${todo[@]}"; do

@@ -11,7 +11,8 @@ only the expert runs per sample. RTC kwargs (leftover, mask end) must already be
 pass; ``predict_chunk_shared`` is predict_action_chunk around it. ``before_integrate(velocity)`` is called once
 before the denoising loop with ``velocity(x_t, time)`` of the cached prefix (an extra expert pass, e.g. to set
 the RTC weights from a check of the old plan under this observation). Only guided / no RTC is supported (not the
-"trained" RTC mode).
+"trained" RTC mode). With ``latent_out`` (a dict) the masked mean of the prefix's last hidden state (one 2048-d vector
+per observation, the VLM summary used as the latent of the correction head) is stored under "latent".
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ def expand_cache(past_key_values, repeats: int):
 
 def sample_actions_shared(model, repeats: int, images, img_masks, tokens, masks, states=None, state_masks=None,
                           noise: Tensor | None = None, num_steps: int | None = None, before_integrate=None,
-                          **kwargs) -> Tensor:
+                          latent_out: dict | None = None, **kwargs) -> Tensor:
     from lerobot.policies.common.flow_matching import euler_integrate
     from lerobot.policies.common.vla_utils import make_att_2d_masks
 
@@ -51,9 +52,12 @@ def sample_actions_shared(model, repeats: int, images, img_masks, tokens, masks,
     mask_dtype = prefix_embs.dtype if model.use_typed_attention_masks else None
     prefix_att_2d_masks_4d = model._prepare_attention_masks_4d(prefix_att_2d_masks, dtype=mask_dtype)  # noqa: SLF001
     model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-    _, past_key_values = model.paligemma_with_expert.forward(
+    outputs, past_key_values = model.paligemma_with_expert.forward(
         attention_mask=prefix_att_2d_masks_4d, position_ids=prefix_position_ids, past_key_values=None,
         inputs_embeds=[prefix_embs, None], use_cache=True)
+    if latent_out is not None:  # outputs[0] = language_model(...).last_hidden_state over the prefix tokens
+        m = prefix_pad_masks[..., None].to(outputs[0].dtype)
+        latent_out["latent"] = ((outputs[0] * m).sum(1) / m.sum(1).clamp(min=1)).float()
 
     # the only change: every observation's prefix serves `repeats` samples
     past_key_values = expand_cache(past_key_values, repeats)

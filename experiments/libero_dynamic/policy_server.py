@@ -20,6 +20,10 @@ Differences from their server, all opt-in except the noise:
   transition whose length grows with the old plan's deviation near the stitch (selection.transition_weights):
   a far-off new plan is blended in slowly, a near one quickly. --trans-power 0 is the constant-length control.
   The old plan is the full chunk kept on the server (the client's leftover is only the returned part).
+* --return-latent (one sample): the chunk goes through the shared-prefix pass (the same computation) and the reply
+  also carries "latent" (masked mean of the prefix's last hidden state, float16) and "full_actions" (the whole
+  chunk in environment space) for the correction head (correction/);
+* request field "rtc_scale" (RTC, one sample): the RTC mask is multiplied by it (weaker attachment for < 1).
 
     uv run --project ../libero_pro --with websockets --with msgpack python policy_server.py --port 8124 --mode rtc
 """
@@ -160,7 +164,7 @@ class Server:
                 "rule": a.rule, "eta": a.eta, "aac_min_h": a.aac_min_h, "s_min": a.s_min, "s_max": a.s_max,
                 "trans_len": a.trans_len, "trans_ref": a.trans_ref, "trans_power": a.trans_power,
                 "trans_min": a.trans_min, "trans_max": a.trans_max, "trans_window": a.trans_window,
-                "fresh_t": a.fresh_t}
+                "fresh_t": a.fresh_t, "return_latent": a.return_latent}
 
     def batch(self, obs: dict) -> dict:
         return self.pre({"observation.images.image": as_image(obs["observation/image"]),
@@ -175,21 +179,54 @@ class Server:
         left, left_len = leftover_tensor(obs, self.horizon) if self.rtc is not None else (None, 0)
         delay = int(obs.get("inference_delay_steps", 0) or 0)
         mask_end = torch.tensor([self.exec_h])
+        scale = float(obs.get("rtc_scale", 1.0) or 1.0)
+        if scale != 1.0 and (self.rtc is None or a.n_samples != 1 or a.mask_mode != "rtc"):
+            raise ValueError("rtc_scale needs --mode rtc with one sample and the plain RTC mask")
         plan: dict[str, Any] = {"sel": 0}
+        latent = None
         with torch.no_grad():
             if a.mask_mode == "transition":
                 chunk, plan = self.infer_transition(batch, noise, left, left_len, delay, mask_end, state)
             elif a.n_samples == 1:
-                kw = {} if left is None else dict(inference_delay=delay, prev_chunk_left_over=left.to(dev),
-                                                   execution_horizon=mask_end)
-                chunk = self.policy.predict_action_chunk(batch, noise=noise.to(dev), **kw).float()
+                chunk, latent = self.infer_single(batch, noise, left, delay, mask_end, scale)
+                if scale != 1.0:
+                    plan["scale"] = round(scale, 4)
             else:
                 chunk, plan = self.infer_samples(batch, noise, left, left_len, delay, mask_end, state)
+        out: dict[str, Any] = {}
+        if latent is not None:
+            full = torch.stack([self.post(chunk[:, i, :]) for i in range(chunk.shape[1])], dim=1)
+            out.update(latent=latent[0].cpu().numpy().astype(np.float16),
+                       full_actions=full[0].detach().cpu().numpy().astype(np.float32))
         chunk = chunk[:, : int(plan.get("len", self.apc))]
         original = chunk[0].detach().cpu().numpy().astype(np.float32)
         actions = torch.stack([self.post(chunk[:, i, :]) for i in range(chunk.shape[1])], dim=1)
         return {"actions": actions[0].detach().cpu().numpy().astype(np.float32), "original_actions": original,
-                "plan": plan}
+                "plan": plan, **out}
+
+    def infer_single(self, batch, noise, left, delay, mask_end, scale: float = 1.0):
+        """One sample, RTC when there is a leftover. -> (chunk (1, H, A), latent (1, D) or None)
+
+        With --return-latent through the shared-prefix pass (the same computation as predict_action_chunk) to also
+        get the latent. rtc_scale != 1 multiplies the RTC mask (the weights BatchRTCProcessor would use itself:
+        the leftover is padded to H, so prev_len = H)."""
+        a, dev = self.args, self.args.device
+        kw = {} if left is None else dict(inference_delay=delay, prev_chunk_left_over=left.to(dev),
+                                           execution_horizon=mask_end)
+        if left is not None and scale != 1.0:
+            w = self.weights_proc.prefix_weights(delay, mask_end, 1, self.horizon, self.horizon)
+            self.rtc.weight_override = (scale * w).to(dev)
+        try:
+            if not a.return_latent:
+                return self.policy.predict_action_chunk(batch, noise=noise.to(dev), **kw).float(), None
+            from shared_prefix import predict_chunk_shared
+
+            info: dict[str, Any] = {}
+            chunk = predict_chunk_shared(self.policy, batch, 1, noise=noise.to(dev), latent_out=info, **kw).float()
+            return chunk, info["latent"]
+        finally:
+            if self.rtc is not None:
+                self.rtc.weight_override = None
 
     def old_plan(self, left, left_len, state):
         """The client's leftover is the unconsumed tail of the chunk we returned (length state["len"]); the old plan
@@ -386,7 +423,11 @@ def parse_args(argv=None):
     p.add_argument("--fresh-t", type=float, default=0.5,
                    help="transition: flow time of the old-plan check (LeRobot: 1 = noise, 0 = clean)")
     p.add_argument("--log-jsonl", default=None, help="append per-request signals (z, dispersion, plan) here")
+    p.add_argument("--return-latent", action="store_true",
+                   help="one sample: also return the prefix latent and the full chunk (correction head)")
     args = p.parse_args(argv)
+    if args.return_latent and (args.n_samples != 1 or args.mask_mode != "rtc"):
+        p.error("--return-latent needs one sample and the plain RTC mask")
     if args.adaptive and args.n_samples < 2:
         p.error("--adaptive needs --n-samples > 1 and --mode rtc")
     if args.n_samples > 1 and args.mode != "rtc":

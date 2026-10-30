@@ -4,7 +4,8 @@
     python3 report_dynamic.py runs/pt_async_k6 runs/ada --ref runs/pt_async_k6 [--speeds 0.06] [--out report.md]
 
 Per run: success per speed and overall, paired Δ to the reference with a 95% bootstrap CI over common episodes,
-policy requests per episode, action change between steps (from the runner's action metrics), and for runs of our
+policy requests per episode, action change between steps (from the runner's action metrics), the mean correction
+norm (L2 per tick) and RTC scale of corrected_rtc_queue runs, and for runs of our
 server the plan statistics from signals_*.jsonl (mean s, h*, share of chunks from a sample other than 0; with
 --mask-mode transition the mean transition length L and the mean and median deviation of the old plan).
 Standard library only (runs with any python3).
@@ -50,6 +51,8 @@ def load(run: Path, speeds) -> dict:
                     "success": bool(r.get("success")),
                     "requests": cs.get("policy_requests"),
                     "delta": find_number(r.get("action_metrics"), ("delta",)),
+                    "corr": cs.get("correction_abs_mean") if cs.get("correction_calls") else None,
+                    "scale": cs.get("rtc_scale_mean"),
                 }
     return out
 
@@ -99,7 +102,7 @@ def main():
     runs = [ref_dir] + [r for r in a.runs if r != ref_dir]
     data = {r: load(r, a.speeds) for r in runs}
     head = ["run"] + [f"v={v}" for v in a.speeds] + ["overall", f"Δ vs {ref_dir.name} [95% CI]", "pairs",
-                                                      "requests/ep", "|Δa|", "plan"]
+                                                      "requests/ep", "|Δa|", "corr |Δa|", "RTC scale", "plan"]
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for r in runs:
         rows = data[r]
@@ -118,6 +121,8 @@ def main():
         lines.append("| " + " | ".join([r.name, *per, overall, delta, pairs,
                                           mean_or_dash([x["requests"] for x in rows.values()], ".1f"),
                                           mean_or_dash([x["delta"] for x in rows.values()], ".4f"),
+                                          mean_or_dash([x["corr"] for x in rows.values()], ".4f"),
+                                          mean_or_dash([x["scale"] for x in rows.values()], ".3f"),
                                           plan_stats(r)]) + " |")
     text = "\n".join(lines) + "\n"
     print(text)
