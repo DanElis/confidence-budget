@@ -79,7 +79,7 @@ def parse_config(spec: str, delay: int) -> tuple[str, budget.LoopConfig]:
     return label, budget.LoopConfig(**kw)
 
 
-def make_rollout(env, env_params, obs_dim, action_dim, num_evals, n_log):
+def make_rollout(env, env_params, obs_dim, action_dim, num_evals, n_log, planner=None):
     env = train_expert.BatchEnvWrapper(
         wrappers.LogWrapper(wrappers.AutoReplayWrapper(train_expert.NoisyActionWrapper(env))), num_evals
     )
@@ -132,7 +132,7 @@ def make_rollout(env, env_params, obs_dim, action_dim, num_evals, n_log):
         obs, state = jax.vmap(env.reset_to_level, in_axes=(0, 0, None))(keys[:, 1], levels, env_params)
         return obs, state, keys[:, 0]
 
-    def rollout(cfg: budget.LoopConfig, rngs, levels, state_dicts, noise_key):
+    def rollout(cfg: budget.LoopConfig, rngs, levels, state_dicts, noise_key, controller=None, controller_key=None):
         obs0, state0, step_keys = reset(rngs, levels)
 
         def step_fn(t, state, action):
@@ -154,9 +154,11 @@ def make_rollout(env, env_params, obs_dim, action_dim, num_evals, n_log):
             w = lambda e: _model.get_prefix_weights(cfg.d, e, horizon, cfg.schedule)  # noqa: E731
             return jax.vmap(jax.vmap(w))(mask_end)
 
+        choose = None if planner is None else lambda *xs: planner(controller, controller_key, *xs)
         return budget.run_loop(
             cfg, horizon, action_dim, num_steps, obs0, state0, step_fn, sample_fn, guided_fn, weights_fn,
-            noise_key, n_log,
+            noise_key, n_log, plan_fn=choose,
+            initial_mask=None if planner is None else controller["initial_mask"],
         )
 
     return jax.jit(rollout, static_argnums=0), horizon

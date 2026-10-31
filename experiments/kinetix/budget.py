@@ -232,7 +232,14 @@ def run_loop(
     weights_fn: Callable | None,
     noise_key: jax.Array,
     n_log: int = 0,
+    plan_fn: Callable | None = None,
+    initial_mask=None,
 ):
+    """Run first episodes. Optional plan_fn(t, obs, new_chunk, leftover, off, old_mask)
+    returns (stride, next_mask_end, logs) at request boundaries. Its inputs contain
+    no future environment observations; the new chunk becomes available after d.
+    The returned mask belongs to the NEXT request, as in budget_plan.
+    """
     d, n_k = cfg.d, cfg.n_samples
     lead = jax.tree.leaves(obs0)[0].shape[:2]  # (L, B)
 
@@ -256,6 +263,8 @@ def run_loop(
 
     # first chunk, synchronous; inference also starts at t = 0 with the plan of this chunk
     chunk0, disp0, _, _, end0, h0, lam0 = infer(num_steps, obs0, None, None, None, first=True)
+    if initial_mask is not None:
+        end0 = jnp.broadcast_to(initial_mask[:, None], lead)
     zl = jnp.zeros(lead, jnp.int32)
     zf = jnp.zeros(lead, jnp.float32)
     carry0 = dict(
@@ -280,7 +289,7 @@ def run_loop(
 
     def body(c, t):
         c, switched = activate(c, t)  # a chunk started d steps ago takes over before the next inference
-        due = c["next_start"] == t
+        due = (c["next_start"] == t) & c["alive"]
         off = t - c["active_start"]
         leftover = shift(c["active"], off)
         leftover_disp = shift(c["active_disp"][..., None], off)[..., 0]
@@ -293,6 +302,11 @@ def run_loop(
             args,
         )
         chunk, disp, sel, s, end, h, lam = new
+        extra = {}
+        if plan_fn is not None:
+            s, end, extra = plan_fn(t, c["obs"], chunk, leftover, off, c["next_mask"])
+            h = s + end  # effective commitment, not a calibrated confidence horizon
+            lam = (s - d) / jnp.maximum(h - 2 * d, 1)
         counted = due & c["alive"]
         c["pending"] = jnp.where(due[..., None, None], chunk, c["pending"])
         c["pending_disp"] = jnp.where(due[..., None], disp, c["pending_disp"])
@@ -331,6 +345,7 @@ def run_loop(
         c["obs"], c["env_state"] = obs, env_state
         log = dict(disp=disp[:, :n_log], due=counted[:, :n_log], action=action[:, :n_log], sel=sel[:, :n_log],
                    end=end[:, :n_log])
+        log.update({k: v[:, :n_log] for k, v in extra.items()})
         return c, log
 
     c, logs = jax.lax.scan(body, carry0, jnp.arange(num_steps))
@@ -341,5 +356,7 @@ def run_loop(
         mean_s=c["sum_s"] / n, frac_sel=c["n_sel"] / n,  # share of chunks where a sample other than 0 was executed
         mean_h=c["sum_h"] / c["n_infer"], mean_mask=c["sum_mask"] / c["n_infer"], mean_lam=c["sum_lam"] / c["n_infer"],
         jump_switch=c["jump_sw"] / jnp.maximum(c["n_sw"], 1), jump_other=c["jump_other"] / jnp.maximum(c["n_other"], 1),
+        action_change=c["jump_sw"] + c["jump_other"],
+        elapsed=jnp.where(c["alive"], num_steps, c["length"]),
     )
     return out, logs
