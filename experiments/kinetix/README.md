@@ -1,5 +1,40 @@
 # Learned adaptive budget on Kinetix
 
+## Fresh-state mask experiment (new)
+
+`night_mask.sh` is the new pilot: fixed s=4, d=2, H=8, learn only r in {0,1,2}.
+The actor sees the fresh symbolic observation, OLD aligned leftover, its age,
+previous mask, time, delay and level identity. It has NO input slot for a newly
+generated chunk. At a request: choose r -> generate ONE RTC chunk using this r
+-> execute with fixed request spacing s. r=0 retains the committed d-prefix.
+The startup chunk is unguided and synchronous, as in the previous runner.
+
+Training is the same on-policy PPO implementation, with call-cost=0 for this
+fixed-stride ablation. Objective: success minus the smoothness penalty below.
+References are the validation-selected constant r at the SAME s and a random
+schedule using validation marginal r frequencies. Different episode durations
+can still change calls/episode; the request spacing itself is identical.
+
+Default pilot: grasp_easy + catapult, one training seed, 8 train environments,
+16 eval environments, up to 8 updates / one hour of training-loop time. There
+are only three fixed-mask validation candidates. Evaluation/compilation and
+checks add time; the deterministic GPU mode is slow. This is an exploratory
+pilot, not a three-seed confirmation. Main outputs are below
+`runs/learned_mask_before_d2_s4/experiment/`.
+
+```bash
+cd ~/work/cv/confidence-budget/experiments/kinetix && bash night_mask.sh diagnose
+```
+
+```bash
+tmux new-session -d -s mask-before 'cd ~/work/cv/confidence-budget/experiments/kinetix && bash night_mask.sh night'
+```
+
+`night` includes CPU tests, deterministic GPU preflight and a complete small
+smoke before training. No new local tests or GPU runs have been executed.
+The old after-generation budget remains available with `night_learned.sh`.
+The following sections describe that original experiment and shared machinery.
+
 `night_learned.sh` trains a small state-based controller over frozen public
 Kinetix flow policies. Default: H=8, d=2, s in {2,3,4}, every feasible soft-window
 length r, giving 12 categorical actions. Decision k chooses s_k and r_(k+1).

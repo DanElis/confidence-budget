@@ -27,7 +27,7 @@ def test_action_space_and_degenerate_delay():
             head.action_pairs(8, 2, strides)
 
 
-def fake_run(cfg, controller=None, stop_at=25):
+def fake_run(cfg, controller=None, stop_at=25, before=False, planner_override=None):
     l, b, h = 2, 3, 8
     obs = jnp.zeros((l, b, 2))
     def sample(o, z):
@@ -44,16 +44,19 @@ def fake_run(cfg, controller=None, stop_at=25):
         return jnp.full_like(obs, (t + 1) / 10), state, done, info
     planner = None
     if controller is not None:
-        fn = head.make_planner(cfg.d, 30)
+        fn = head.make_planner(cfg.d, 30, before_inference=before)
         planner = lambda *xs: fn(controller, jax.random.key(100), *xs)
+    if planner_override is not None:
+        planner = planner_override
     return budget.run_loop(cfg, h, 1, 30, obs, jnp.zeros((l, b)), step, sample, guided, weights,
-                           jax.random.key(10), n_log=b, plan_fn=planner,
+                           jax.random.key(10), n_log=b, plan_fn=None if before else planner,
+                           pre_plan_fn=planner if before else None,
                            initial_mask=None if controller is None else controller["initial_mask"])
 
 
-def fake_controller(mode, fixed=None):
-    pairs = head.action_pairs(8, 2, (2, 3, 4))
-    n_features = 2 + 2 * 8 + 4 + 2
+def fake_controller(mode, fixed=None, before=False):
+    pairs = head.action_pairs(8, 2, (4,) if before else (2, 3, 4))
+    n_features = 2 + (1 if before else 2) * 8 + 4 + 2
     net = head.init_network(jax.random.key(2), n_features, len(pairs), width=8, n_levels=2)
     return head.control(net, n_features, pairs, 2, mode=mode, fixed=fixed)
 
@@ -102,6 +105,34 @@ def test_constant_sampled_actor_matches_fixed_controller():
     np.testing.assert_array_equal(fixed_logs["action"], sampled_logs["action"])
     for k in fixed:
         np.testing.assert_array_equal(fixed[k], sampled[k])
+
+
+@pytest.mark.parametrize("r", [0, 1, 2])
+def test_before_generation_constant_mask_matches_fixed_rtc(r):
+    cfg = budget.LoopConfig(d=2, s=4, mask_end=2 + r, guidance=True)
+    ctrl = fake_controller(2, fixed=np.full(2, r, np.int32), before=True)
+    expected, logs0 = fake_run(cfg)
+    actual, logs = fake_run(cfg, ctrl, before=True)
+    np.testing.assert_allclose(logs["action"], logs0["action"], atol=1e-6)
+    np.testing.assert_array_equal(actual["n_infer"], expected["n_infer"])
+    assert logs["head_x"].shape[-1] == 2 + 8 + 4 + 2
+    sampled, logs1 = fake_run(cfg, head.constant_actor(dict(ctrl, mode=jnp.asarray(0, jnp.int32))), before=True)
+    np.testing.assert_array_equal(logs["head_id"], logs1["head_id"])
+    np.testing.assert_allclose(logs["action"], logs1["action"], atol=1e-6)
+
+
+def test_fresh_mask_changes_current_generation_without_a_second_call():
+    cfg = budget.LoopConfig(d=2, s=4, mask_end=2, guidance=True)
+    def choose(t, obs, chunk, leftover, age, old_mask):
+        assert chunk is None  # cannot consume a not-yet-generated chunk
+        end = jnp.where(obs[..., 0] < 0.3, 2, 4).astype(jnp.int32)
+        return jnp.full_like(end, 4), end, {}
+    _, base = fake_run(cfg)
+    result, logs = fake_run(cfg, before=True, planner_override=choose)
+    np.testing.assert_allclose(logs["action"][:6], base["action"][:6], atol=1e-6)
+    assert not np.allclose(logs["action"][6], base["action"][6])  # request at 4, arrives at 6
+    np.testing.assert_array_equal(np.flatnonzero(np.asarray(logs["due"])[:, 0, 0]), np.arange(0, 25, 4))
+    np.testing.assert_array_equal(result["n_infer"], np.full((2, 3), 8))  # warm start + seven requests
 
 
 def test_control_time_rewards_ignore_actions_after_termination():

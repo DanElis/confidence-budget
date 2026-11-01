@@ -234,13 +234,18 @@ def run_loop(
     n_log: int = 0,
     plan_fn: Callable | None = None,
     initial_mask=None,
+    pre_plan_fn: Callable | None = None,
 ):
     """Run first episodes. Optional plan_fn(t, obs, new_chunk, leftover, off, old_mask)
     returns (stride, next_mask_end, logs) at request boundaries. Its inputs contain
     no future environment observations; the new chunk becomes available after d.
     The returned mask belongs to the NEXT request, as in budget_plan.
+    pre_plan_fn instead receives new_chunk=None and selects the CURRENT mask
+    before infer runs. The two planner hooks are mutually exclusive.
     """
     d, n_k = cfg.d, cfg.n_samples
+    if pre_plan_fn is not None and plan_fn is not None:
+        raise ValueError("choose before OR after inference")
     lead = jax.tree.leaves(obs0)[0].shape[:2]  # (L, B)
 
     def noise(t, k):
@@ -293,7 +298,12 @@ def run_loop(
         off = t - c["active_start"]
         leftover = shift(c["active"], off)
         leftover_disp = shift(c["active_disp"][..., None], off)[..., 0]
-        args = (t, c["obs"], leftover, leftover_disp, c["next_mask"])
+        extra = {}
+        before = None
+        if pre_plan_fn is not None:
+            before = pre_plan_fn(t, c["obs"], None, leftover, off, c["next_mask"])
+        current_mask = c["next_mask"] if before is None else before[1]
+        args = (t, c["obs"], leftover, leftover_disp, current_mask)
         out_shape = jax.eval_shape(lambda *a: infer(*a, first=False), *args)
         new = jax.lax.cond(
             due.any(),
@@ -302,7 +312,10 @@ def run_loop(
             args,
         )
         chunk, disp, sel, s, end, h, lam = new
-        extra = {}
+        if before is not None:
+            s, end, extra = before
+            h = s + end
+            lam = (s - d) / jnp.maximum(h - 2 * d, 1)
         if plan_fn is not None:
             s, end, extra = plan_fn(t, c["obs"], chunk, leftover, off, c["next_mask"])
             h = s + end  # effective commitment, not a calibrated confidence horizon
@@ -354,6 +367,7 @@ def run_loop(
         solved=c["solved"], ret=c["ret"], length=c["length"], unfinished=c["alive"],
         n_infer=c["n_infer"],
         mean_s=c["sum_s"] / n, frac_sel=c["n_sel"] / n,  # share of chunks where a sample other than 0 was executed
+        mean_selected_mask=(c["sum_mask"] - end0) / n,
         mean_h=c["sum_h"] / c["n_infer"], mean_mask=c["sum_mask"] / c["n_infer"], mean_lam=c["sum_lam"] / c["n_infer"],
         jump_switch=c["jump_sw"] / jnp.maximum(c["n_sw"], 1), jump_other=c["jump_other"] / jnp.maximum(c["n_other"], 1),
         action_change=c["jump_sw"] + c["jump_other"],

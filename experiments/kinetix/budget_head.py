@@ -3,6 +3,8 @@
 Actions are (s_k, r_{k+1}). Decisions use the request's observation and generated
 chunk; r_{k+1} is the soft window of the next request. Monte Carlo returns use
 gamma=1 in CONTROL TIME, not one discount per variably sized chunk.
+With before_inference=True, inputs exclude the new chunk entirely and the
+chosen r belongs to the CURRENT generation; the driver fixes s in that mode.
 """
 
 from __future__ import annotations
@@ -47,7 +49,16 @@ def forward(net, x, mean, std):
     return x @ net["actor"]["w"] + net["actor"]["b"] + task_bias, (x @ net["value"]["w"] + net["value"]["b"])[..., 0]
 
 
-def make_planner(delay: int, total_steps: int, record_features: bool = True):
+def features_before(t, obs, leftover, age, old_mask, *, delay, total_steps):
+    """Fresh observation and OLD plan only; no placeholder for a future chunk."""
+    l, b, h = leftover.shape[:3]
+    level = jnp.broadcast_to(jnp.eye(l)[:, None], (l, b, l))
+    scalars = jnp.stack([jnp.full_like(age, t, dtype=jnp.float32) / total_steps,
+                         age / h, old_mask / h, jnp.full_like(age, delay, dtype=jnp.float32) / h], -1)
+    return jnp.concatenate([obs, leftover.reshape(l, b, -1), scalars, level], -1)
+
+
+def make_planner(delay: int, total_steps: int, record_features: bool = True, before_inference: bool = False):
     """Modes: 0 sampled actor (also evaluation), 1 argmax actor, 2 per-level fixed, 3 marginal random.
 
     Evaluations use mode 0: PPO learns a stochastic policy, so validation/test do
@@ -55,7 +66,10 @@ def make_planner(delay: int, total_steps: int, record_features: bool = True):
     retaining the action frequencies measured on validation.
     """
     def choose(ctrl, key, t, obs, chunk, leftover, age, old_mask):
-        x = features(t, obs, chunk, leftover, age, old_mask, delay=delay, total_steps=total_steps)
+        if before_inference:
+            x = features_before(t, obs, leftover, age, old_mask, delay=delay, total_steps=total_steps)
+        else:
+            x = features(t, obs, chunk, leftover, age, old_mask, delay=delay, total_steps=total_steps)
         logits, value = forward(ctrl["net"], x, ctrl["mean"], ctrl["std"])
         lp = jax.nn.log_softmax(logits)
         k = jax.random.fold_in(key, t)

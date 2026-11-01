@@ -102,12 +102,14 @@ class Experiment:
         self.n_levels = len(paths)
         self.eval_fn, self.horizon = budget_loop.make_rollout(
             env, ep, obs_dim, action_dim, args.eval_envs, args.eval_envs,
-            planner=head.make_planner(args.delay, self.total_steps, record_features=False))
+            planner=head.make_planner(args.delay, self.total_steps, record_features=False, before_inference=args.mask_before),
+            before_inference=args.mask_before)
         self.train_fn, _ = budget_loop.make_rollout(
             env, ep, obs_dim, action_dim, args.train_envs, args.train_envs,
-            planner=head.make_planner(args.delay, self.total_steps))
+            planner=head.make_planner(args.delay, self.total_steps, before_inference=args.mask_before),
+            before_inference=args.mask_before)
         self.pairs = head.action_pairs(self.horizon, args.delay, tuple(args.strides))
-        self.inputs = obs_dim + 2 * self.horizon * action_dim + 4 + self.n_levels
+        self.inputs = obs_dim + (1 if args.mask_before else 2) * self.horizon * action_dim + 4 + self.n_levels
         self.base = budget.LoopConfig(d=args.delay, s=args.reference_stride, guidance=True,
                                      mask_end=self.horizon - args.reference_stride)
         self.base.validate(self.horizon)
@@ -139,7 +141,8 @@ class Experiment:
                 raise RuntimeError("experiment configuration/source/checkpoint changed; choose a NEW --out directory")
         else:
             atomic_json(manifest, dict(identity=identity, git_commit=revision,
-                                      primary="mean paired SR difference vs per-model per-level frequency-matched fixed budget selected on validation",
+                                      primary=("learned current r vs validation-selected fixed r, same fixed stride" if args.mask_before else
+                                               "mean paired SR difference vs per-model per-level frequency-matched fixed budget selected on validation"),
                                       seed_protocol="training >=10000, validation 1000.., test 2000..; no test-based selection",
                                       notes="state-based policy; fixed set of levels; simulated d independent of wall time"))
         self.identity = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -200,6 +203,7 @@ class Experiment:
             successes.append(result["solved"].mean(1))
         self.grid_rates, self.grid_successes = np.asarray(rates), np.asarray(successes)
         ids = np.argmax(np.asarray(scores), axis=0).astype(np.int32)
+        self.fixed_ids = ids
         atomic_json(self.out / "fixed_selection.json", dict(levels=self.names, action_ids=ids.tolist(),
                     pairs=self.pairs[ids].tolist(), validation_scores=np.asarray(scores).tolist()))
         stamp(f"validation-selected fixed budgets: {dict(zip(self.names, self.pairs[ids].tolist()))}")
@@ -209,6 +213,8 @@ class Experiment:
         """Best validation SR among constants within 5% of the learned validation rate;
         otherwise nearest rate. The test report flags any remaining cost mismatch.
         """
+        if self.a.mask_before:
+            return self.fixed_ids.copy()
         target = (result["n_infer"] / np.maximum(result["elapsed"], 1)).mean(1)
         relative_error = np.abs(self.grid_rates / target[None] - 1)
         eligible = relative_error <= 0.05
@@ -327,11 +333,15 @@ def report(exp, fixed, learned, random_controls, matched_refs):
     selected_steps = {seed: json.loads((exp.out / f"model_{seed}" / "done.json").read_text())["selected_step"]
                       for seed in a.model_seeds[:len(learned)]}
     lines = ["# Learned budget on Kinetix", "",
+             (f"CURRENT-mask experiment: fixed s={a.reference_stride}; choose r BEFORE generation from fresh observation and OLD leftover. "
+              "No new-chunk features; reference is validation-selected fixed r at the same stride."
+              if a.mask_before else "Original experiment: choose s and NEXT mask after generation."), "",
              f"Frozen public flow policies, H={exp.horizon}, d={a.delay}; levels={len(exp.names)}. "
              f"Evaluated model seeds={a.model_seeds[:len(learned)]}; held-out test RNGs={a.test_seeds}. "
              f"{'COMPLETE' if len(learned) == len(a.model_seeds) else 'PARTIAL: some model seeds still pending'}.", "",
              f"Selected checkpoint iterations (validation only): {selected_steps}.", "",
-             "The primary reference is a per-model, per-level constant (s,r) selected ONLY on validation to match the learned call rate. "
+             ("The primary reference is the per-level fixed r selected ONLY on validation, with the same fixed stride. " if a.mask_before else
+              "The primary reference is a per-model, per-level constant (s,r) selected ONLY on validation to match the learned call rate. ") +
              "The global fixed reference in the table is selected by the training objective, separately per level. "
              "Marginal-random controls use each learned model's per-level action frequencies on validation. "
              "They remove state dependence but do not enforce exactly equal test cost. "
@@ -354,11 +364,15 @@ def report(exp, fixed, learned, random_controls, matched_refs):
     add("learned mean over training seeds", learned, ref)
     add("frequency-matched fixed mean", matched_refs, ref)
     add("marginal-random mean", random_controls, ref)
+    lines += ["", "Mean selected soft-window r (excluding warm start): " + ", ".join(
+        f"seed {seed}: {float(r['mean_selected_mask'].mean() - a.delay):.3f}"
+        for seed, r in zip(a.model_seeds, learned)) + "."]
     m, lo, hi = paired_ci(100 * (np.stack([r["solved"] for r in learned])
                                 - np.stack([r["solved"] for r in random_controls])))
     primary = paired_ci(100 * (np.stack([r["solved"] for r in learned])
                               - np.stack([r["solved"] for r in matched_refs])))
-    lines += ["", f"PRIMARY learned vs frequency-matched fixed: {primary[0]:+.2f} pp [{primary[1]:+.2f}; {primary[2]:+.2f}].",
+    primary_name = "learned r vs fixed r at the same stride" if a.mask_before else "learned vs frequency-matched fixed"
+    lines += ["", f"PRIMARY {primary_name}: {primary[0]:+.2f} pp [{primary[1]:+.2f}; {primary[2]:+.2f}].",
               f"State-dependent vs marginal-random (exploratory): {m:+.2f} pp [{lo:+.2f}; {hi:+.2f}].",
               "CI resamples training seeds and episodes within the FIXED levels; it does not establish transfer to new levels. "
               "Only the aggregate learned-vs-frequency-matched-fixed SR difference is primary; other comparisons are exploratory.", "",
@@ -397,6 +411,7 @@ def main():
     p.add_argument("--delay", type=int, default=2)
     p.add_argument("--strides", type=int, nargs="+", default=[2, 3, 4])
     p.add_argument("--reference-stride", type=int, default=2)
+    p.add_argument("--mask-before", action="store_true", help="choose current RTC mask BEFORE generation; requires one fixed stride")
     p.add_argument("--train-envs", type=int, default=32)
     p.add_argument("--eval-envs", type=int, default=256)
     p.add_argument("--iterations", type=int, default=40)
@@ -438,6 +453,8 @@ def main():
         p.error("iterations must be <100000 (disjoint model training RNG ranges)")
     if a.reference_stride not in a.strides:
         p.error("reference-stride must be one of --strides")
+    if a.mask_before and len(a.strides) != 1:
+        p.error("--mask-before requires exactly one fixed --strides value")
     if not any(d.platform == "gpu" for d in jax.devices()):
         raise SystemExit("GPU required for real-model runs; use the CPU pytest preflight for synthetic tests")
     exp = Experiment(a)
@@ -449,8 +466,9 @@ def main():
             return
         # Scientific comparisons all use exp.eval_fn, including fixed controls.
         # Verify sampled-actor mode against fixed mode in that SAME executable.
-        ids = np.full(exp.n_levels, np.flatnonzero((exp.pairs == (a.reference_stride, 0)).all(1))[0], np.int32)
-        cfg = dataclasses.replace(exp.base, mask_end=a.delay)
+        check_r = int(exp.pairs[:, 1].max()) if a.mask_before else 0
+        ids = np.full(exp.n_levels, np.flatnonzero((exp.pairs == (a.reference_stride, check_r)).all(1))[0], np.int32)
+        cfg = dataclasses.replace(exp.base, mask_end=a.delay + check_r)
         constant = head.constant_actor(exp.fixed_controller(ids))
         controlled, logs = exp.rollout(constant, 3000, cfg=cfg)
         repeated, repeat_logs = exp.rollout(constant, 3000, cfg=cfg)

@@ -79,7 +79,7 @@ def parse_config(spec: str, delay: int) -> tuple[str, budget.LoopConfig]:
     return label, budget.LoopConfig(**kw)
 
 
-def make_rollout(env, env_params, obs_dim, action_dim, num_evals, n_log, planner=None):
+def make_rollout(env, env_params, obs_dim, action_dim, num_evals, n_log, planner=None, before_inference=False):
     env = train_expert.BatchEnvWrapper(
         wrappers.LogWrapper(wrappers.AutoReplayWrapper(train_expert.NoisyActionWrapper(env))), num_evals
     )
@@ -157,7 +157,8 @@ def make_rollout(env, env_params, obs_dim, action_dim, num_evals, n_log, planner
         choose = None if planner is None else lambda *xs: planner(controller, controller_key, *xs)
         return budget.run_loop(
             cfg, horizon, action_dim, num_steps, obs0, state0, step_fn, sample_fn, guided_fn, weights_fn,
-            noise_key, n_log, plan_fn=choose,
+            noise_key, n_log, plan_fn=None if before_inference else choose,
+            pre_plan_fn=choose if before_inference else None,
             initial_mask=None if planner is None else controller["initial_mask"],
         )
 
