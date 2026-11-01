@@ -10,9 +10,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 MODE=${1:-night}
 (( $# == 0 )) || shift
-[[ $MODE == night || $MODE == smoke ]] || { echo "usage: bash night_learned.sh smoke|night [learn_budget.py args]"; exit 2; }
+[[ $MODE == night || $MODE == smoke || $MODE == diagnose ]] || { echo "usage: bash night_learned.sh smoke|night|diagnose [learn_budget.py args]"; exit 2; }
 for arg in "$@"; do
-  case "$arg" in --out|--out=*|--smoke|--preflight) echo "Use OUT=... and the shell mode instead of $arg"; exit 2;; esac
+  case "$arg" in --out|--out=*|--smoke|--preflight|--repeat-only) echo "Use OUT=... and the shell mode instead of $arg"; exit 2;; esac
 done
 RTC="$HERE/third_party/real-time-chunking-kinetix"
 [[ -x "$RTC/.venv/bin/python" && -d "$HERE/assets/bc" ]] || {
@@ -20,7 +20,7 @@ RTC="$HERE/third_party/real-time-chunking-kinetix"
 }
 for command in uv nvidia-smi flock setsid; do command -v "$command" >/dev/null || { echo "missing $command"; exit 1; }; done
 GPU=${GPU:-0}
-export CUDA_VISIBLE_DEVICES="$GPU" XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1
+export CUDA_VISIBLE_DEVICES="$GPU" XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1 KINETIX_DETERMINISTIC=1
 unset JAX_PLATFORMS JAX_PLATFORM_NAME || true
 OUT=$(realpath -m "${OUT:-$HERE/runs/learned_d2}")
 [[ $MODE == smoke ]] && OUT="${OUT}_smoke"
@@ -60,8 +60,11 @@ while true; do
   sleep 30
 done
 nvidia-smi --id="$GPU" --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv
-echo "2 real-model preflight: fixed vs sampled constant actor in common executable; legacy timing check"
-run bash "$HERE/run.sh" learn_budget.py --out "$OUT/preflight" --preflight "$@"
+echo "2a diagnose an identical-controller repeat with default GPU operations (no training)"
+run env KINETIX_DETERMINISTIC=0 bash "$HERE/run.sh" learn_budget.py --out "$OUT/repeat_default" --repeat-only "$@"
+echo "2b deterministic GPU preflight: identical repeat, fixed vs actor, legacy timing"
+run env KINETIX_DETERMINISTIC=1 bash "$HERE/run.sh" learn_budget.py --out "$OUT/preflight" --preflight "$@"
+if [[ $MODE == diagnose ]]; then echo "Diagnosis complete; no training started. See $OUT/{repeat_default,preflight}/*diagnostics.json"; exit 0; fi
 if [[ $MODE == smoke ]]; then
   echo "3 small end-to-end smoke: validation grid, one PPO iteration, held-out test"
   run bash "$HERE/run.sh" learn_budget.py --out "$OUT/experiment" --smoke "$@"

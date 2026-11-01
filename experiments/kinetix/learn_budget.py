@@ -19,6 +19,15 @@ import subprocess
 import time
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Must be set before importing JAX. Kinetix physics uses floating-point scatter
+# reductions, which can be nondeterministic even in one compiled executable.
+if os.environ.get("KINETIX_DETERMINISTIC", "1") == "1":
+    flags = os.environ.get("XLA_FLAGS", "")
+    flag = "--xla_gpu_exclude_nondeterministic_ops=true"
+    if "--xla_gpu_exclude_nondeterministic_ops" in flags and flag not in flags:
+        raise SystemExit("conflicting XLA GPU determinism flag")
+    if flag not in flags:
+        os.environ["XLA_FLAGS"] = (flags + " " + flag).strip()
 
 import jax
 import jax.numpy as jnp
@@ -121,6 +130,8 @@ class Experiment:
                         upstream_commit=upstream_revision, upstream_diff_sha256=hashlib.sha256(upstream_diff).hexdigest(),
                         versions={name: importlib.metadata.version(name) for name in ("jax", "jaxlib", "flax", "optax", "numpy")},
                         devices=[d.device_kind for d in jax.devices()])
+        identity["runtime"] = dict(xla_flags=os.environ.get("XLA_FLAGS", ""),
+                                   deterministic_requested=os.environ.get("KINETIX_DETERMINISTIC", "1"))
         manifest = self.out / "experiment.json"
         if manifest.exists():
             old = json.loads(manifest.read_text())
@@ -402,8 +413,11 @@ def main():
     p.add_argument("--smooth-cost", type=float, default=0.05)
     p.add_argument("--smoke", action="store_true", help="tiny end-to-end run, separate output directory")
     p.add_argument("--preflight", action="store_true", help="real-model equivalence check against the existing fixed loop, then exit")
+    p.add_argument("--repeat-only", action="store_true", help="diagnose identical-controller repeats, save results, never train")
     a = p.parse_args()
     a.out, a.run_path = a.out.resolve(), a.run_path.resolve()
+    if a.repeat_only:
+        a.preflight = True
     if a.smoke or a.preflight:
         a.levels = a.levels or ["grasp_easy"]
         a.train_envs = a.eval_envs = 4
@@ -439,8 +453,20 @@ def main():
         cfg = dataclasses.replace(exp.base, mask_end=a.delay)
         constant = head.constant_actor(exp.fixed_controller(ids))
         controlled, logs = exp.rollout(constant, 3000, cfg=cfg)
+        repeated, repeat_logs = exp.rollout(constant, 3000, cfg=cfg)
+        repeat = preflight.compare_rollouts(controlled, logs, repeated, repeat_logs, delay=a.delay)
+        if repeat.get("max_abs_action_diff", float("inf")) != 0:
+            repeat["failures"].append("identical-controller repeat is not bit-reproducible")
+        repeat["passed"] = not repeat["failures"]
+        atomic_json(exp.out / "repeat_diagnostics.json", repeat)
+        stamp(f"identical-controller repeat: {json.dumps(repeat, allow_nan=False)}")
+        if a.repeat_only:
+            stamp("repeat-only diagnostic complete; no training was started")
+            return
         sampled, sampled_logs = exp.rollout(dict(constant, mode=jnp.asarray(0, jnp.int32)), 3000, cfg=cfg)
         diagnostics = preflight.compare_rollouts(controlled, logs, sampled, sampled_logs, delay=a.delay)
+        diagnostics["failures"].extend(f"repeat: {f}" for f in repeat["failures"])
+        diagnostics["identical_controller_repeat"] = repeat
         if diagnostics.get("max_abs_action_diff", float("inf")) != 0:
             diagnostics["failures"].append("common executable: actions must be bit-identical")
         diagnostics["passed"] = not diagnostics["failures"]

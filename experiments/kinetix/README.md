@@ -42,6 +42,22 @@ nvidia-smi
 
 ## Overnight run
 
+GPU execution determinism is explicitly requested with
+`--xla_gpu_exclude_nondeterministic_ops=true` before JAX import; XLA flags are
+recorded in the manifest. This can slow compilation/execution or fail compilation
+if the installed XLA lacks a deterministic lowering. There is no silent fallback.
+The preflight first records two identical-controller runs with default GPU ops,
+then requires reproducible repeats and fixed/actor equivalence with determinism.
+To run these checks without training:
+
+```bash
+cd ~/work/cv/confidence-budget/experiments/kinetix && OUT=runs/learned_d2_v4 bash night_learned.sh diagnose
+```
+
+Inspect `repeat_default/repeat_diagnostics.json` and
+`preflight/repeat_diagnostics.json`. If diagnosis passes, the same OUT can be
+used with `night`; the verified deterministic preflight is reused.
+
 ```bash
 tmux new-session -d -s budget 'cd ~/work/cv/confidence-budget/experiments/kinetix && bash night_learned.sh night'
 ```
