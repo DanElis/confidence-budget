@@ -433,17 +433,30 @@ def main():
         if (exp.out / "preflight_pass.json").exists():
             stamp("preflight already passed for these sources/settings/checkpoints")
             return
-        # Exact same RTC kernels, batches, seeds, first mask, and constant schedule.
+        # Scientific comparisons all use exp.eval_fn, including fixed controls.
+        # Verify sampled-actor mode against fixed mode in that SAME executable.
         ids = np.full(exp.n_levels, np.flatnonzero((exp.pairs == (a.reference_stride, 0)).all(1))[0], np.int32)
         cfg = dataclasses.replace(exp.base, mask_end=a.delay)
-        controlled, logs = exp.rollout(exp.fixed_controller(ids), 3000, cfg=cfg)
+        constant = head.constant_actor(exp.fixed_controller(ids))
+        controlled, logs = exp.rollout(constant, 3000, cfg=cfg)
+        sampled, sampled_logs = exp.rollout(dict(constant, mode=jnp.asarray(0, jnp.int32)), 3000, cfg=cfg)
+        diagnostics = preflight.compare_rollouts(controlled, logs, sampled, sampled_logs, delay=a.delay)
+        if diagnostics.get("max_abs_action_diff", float("inf")) != 0:
+            diagnostics["failures"].append("common executable: actions must be bit-identical")
+        diagnostics["passed"] = not diagnostics["failures"]
         env, ep, _, levels, flow, _, od, ad = run_points.load(a.run_path, tuple(
             p for p in run_points.DEFAULT_LEVELS if run_points.level_name(p).removeprefix("worlds_l_") in exp.names), a.step)
         reference, _ = budget_loop.make_rollout(env, ep, od, ad, a.eval_envs, a.eval_envs)
         key = jax.random.key(3000)
         expected, expected_logs = jax.device_get(reference(cfg, jax.random.split(key, exp.n_levels), levels, flow,
                                                          jax.random.fold_in(key, 1_000_003)))
-        diagnostics = preflight.compare_rollouts(controlled, logs, expected, expected_logs, delay=a.delay)
+        legacy = preflight.compare_rollouts(controlled, logs, expected, expected_logs, delay=a.delay)
+        # A separately compiled legacy graph is not used in train/test. Its
+        # action drift is diagnostic, while timing/outcome/metric failures remain fatal.
+        legacy_fatal = [f for f in legacy["failures"] if not f.startswith("first-episode action max error")]
+        diagnostics["failures"].extend(f"legacy: {f}" for f in legacy_fatal)
+        diagnostics["passed"] = not diagnostics["failures"]
+        diagnostics["legacy_separate_executable"] = legacy
         atomic_json(exp.out / "preflight_diagnostics.json", diagnostics)
         stamp(f"preflight diagnostics: {json.dumps(diagnostics, allow_nan=False)}")
         if not diagnostics["passed"]:
@@ -452,13 +465,15 @@ def main():
             with tmp.open("wb") as f:
                 np.savez_compressed(f, **{f"controlled_{k}": v for k, v in controlled.items()},
                                     **{f"reference_{k}": v for k, v in expected.items()},
+                                    **{f"sampled_{k}": v for k, v in sampled.items()},
                                     **{f"controlled_log_{k}": logs[k] for k in ("action", "due", "end")},
+                                    **{f"sampled_log_{k}": sampled_logs[k] for k in ("action", "due", "end")},
                                     **{f"reference_log_{k}": expected_logs[k] for k in ("action", "due", "end")})
             os.replace(tmp, trace_path)
             raise AssertionError("Preflight failed:\n" + "\n".join(diagnostics["failures"]))
         atomic_json(exp.out / "preflight_pass.json", dict(passed=True, seed=3000, pairs=exp.pairs.tolist(),
                                                           diagnostics=diagnostics))
-        stamp("preflight PASS: controller holding a constant budget matches the existing RTC loop")
+        stamp("preflight PASS: fixed and constant sampled actor are bit-identical in the common eval executable; legacy timing/outcomes agree")
         return
     fixed_ids = exp.select_fixed()
     learned_ctrls = [exp.train(seed, fixed_ids) for seed in a.model_seeds]

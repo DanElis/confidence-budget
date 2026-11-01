@@ -92,6 +92,18 @@ def test_variable_stride_and_next_mask_alignment():
                                   np.asarray(result["n_infer"] - 1).sum(1))
 
 
+def test_constant_sampled_actor_matches_fixed_controller():
+    ctrl = head.constant_actor(fake_controller(2, fixed=np.array([1, 10], np.int32)))
+    cfg = budget.LoopConfig(d=2, s=2, guidance=True)
+    fixed, fixed_logs = fake_run(cfg, ctrl)
+    sampled, sampled_logs = fake_run(cfg, dict(ctrl, mode=jnp.asarray(0, jnp.int32)))
+    np.testing.assert_array_equal(fixed_logs["due"], sampled_logs["due"])
+    np.testing.assert_array_equal(fixed_logs["head_id"], sampled_logs["head_id"])
+    np.testing.assert_array_equal(fixed_logs["action"], sampled_logs["action"])
+    for k in fixed:
+        np.testing.assert_array_equal(fixed[k], sampled[k])
+
+
 def test_control_time_rewards_ignore_actions_after_termination():
     due = np.zeros((6, 1, 2), bool)
     due[[0, 2], 0, 0] = True

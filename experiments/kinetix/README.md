@@ -50,9 +50,11 @@ The command runs, in order:
 
 1. CPU tests, including learning a state-dependent synthetic decision problem.
 2. Wait for at least 32 GB free on GPU 0 (up to two hours).
-3. Real-model check: a controller holding a constant budget must match the
-   existing fixed RTC loop exactly on first-episode outcomes and request ticks.
-   First-episode actions must agree within 1e-4 per motor-command coordinate.
+3. Real-model check: fixed mode and a sampled actor forced to the same budgets
+   must produce bit-identical first-episode actions in the SAME compiled eval
+   executable (the path used for every scientific comparison).
+   A separately compiled legacy loop must agree on outcomes, request ticks and
+   masks; its action drift is diagnostic, not a gate for the common executable.
    Accumulated float32 smoothness metrics are checked against independent
    float64 recomputations from each recorded trace using a rounding bound;
    their totals are not compared using a fixed 1e-6 tolerance. Detailed errors

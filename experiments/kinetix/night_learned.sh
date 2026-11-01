@@ -60,7 +60,7 @@ while true; do
   sleep 30
 done
 nvidia-smi --id="$GPU" --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv
-echo "2 real-model preflight: constant learned-controller path vs existing fixed RTC loop"
+echo "2 real-model preflight: fixed vs sampled constant actor in common executable; legacy timing check"
 run bash "$HERE/run.sh" learn_budget.py --out "$OUT/preflight" --preflight "$@"
 if [[ $MODE == smoke ]]; then
   echo "3 small end-to-end smoke: validation grid, one PPO iteration, held-out test"

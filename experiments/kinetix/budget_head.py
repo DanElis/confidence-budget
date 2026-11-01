@@ -84,6 +84,19 @@ def control(net, inputs, pairs, n_levels, *, delay=2, mode=0, fixed=None, margin
                 std=jnp.ones(inputs) if std is None else jnp.asarray(std))
 
 
+def constant_actor(controller):
+    """Preflight actor whose sampled decision equals controller['fixed'] with certainty.
+
+    Keep all tensor shapes unchanged: modes 0 and 2 use the SAME compiled eval
+    executable. Only the mode scalar differs between the two preflight calls.
+    """
+    ids = jnp.asarray(controller["fixed"])
+    net = dict(controller["net"])
+    net["actor"] = jax.tree.map(jnp.zeros_like, net["actor"])
+    net["task_bias"] = jnp.full_like(net["task_bias"], -1e9).at[jnp.arange(len(ids)), ids].set(0)
+    return dict(controller, net=net)
+
+
 def rewards_to_go(result, logs, *, call_cost: float, smooth_cost: float, reference_stride: int):
     """Undiscounted rewards on ticks; only the first episode contributes.
 
