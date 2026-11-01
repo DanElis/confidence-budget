@@ -51,7 +51,13 @@ The command runs, in order:
 1. CPU tests, including learning a state-dependent synthetic decision problem.
 2. Wait for at least 32 GB free on GPU 0 (up to two hours).
 3. Real-model check: a controller holding a constant budget must match the
-   existing fixed RTC loop on actions, success, requests and smoothness metrics.
+   existing fixed RTC loop exactly on first-episode outcomes and request ticks.
+   First-episode actions must agree within 1e-4 per motor-command coordinate.
+   Accumulated float32 smoothness metrics are checked against independent
+   float64 recomputations from each recorded trace using a rounding bound;
+   their totals are not compared using a fixed 1e-6 tolerance. Detailed errors
+   are saved to `preflight/preflight_diagnostics.json`, including on failure;
+   a failed comparison also saves the paired traces in `preflight_failure.npz`.
 4. Tiny full pipeline (one level, four environments, one PPO iteration).
 5. Validation grid of all 12 fixed budgets on all 12 levels.
 6. Three training seeds, up to 40 iterations each; four hours of training-loop
@@ -82,6 +88,9 @@ Extra Python arguments follow the mode, e.g. `night --levels grasp_easy catapult
 Changing levels, seeds, source code, packages, checkpoints or hyperparameters
 requires a new OUT. A repeated identical command skips completed evaluations and
 finished models; interrupted training resumes from the latest completed iteration.
+After updating code to fix a failed preflight, choose a new OUT, for example
+`OUT=runs/learned_d2_v2 bash night_learned.sh night`. Keep the old failed-run
+directory for diagnosis; the source-hash guard intentionally rejects its reuse.
 Checkpoint files are local pickle files and should not be loaded from untrusted sources.
 
 ## Protocol and outputs
@@ -112,6 +121,7 @@ Default files:
 
     runs/learned_d2/night.log
     runs/learned_d2/preflight/preflight_pass.json
+    runs/learned_d2/preflight/preflight_diagnostics.json
     runs/learned_d2/smoke/report.md
     runs/learned_d2/experiment/experiment.json
     runs/learned_d2/experiment/fixed_selection.json

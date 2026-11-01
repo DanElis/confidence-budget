@@ -27,6 +27,7 @@ import numpy as np
 import budget
 import budget_head as head
 import budget_loop
+import preflight
 import run_points
 
 
@@ -104,7 +105,7 @@ class Experiment:
         dummy = head.init_network(jax.random.key(0), self.inputs, len(self.pairs), args.width, self.n_levels)
         self.dummy = head.control(dummy, self.inputs, self.pairs, self.n_levels, delay=args.delay)
         source = hashlib.sha256()
-        for name in ("learn_budget.py", "budget_head.py", "budget.py", "budget_loop.py", "run_points.py"):
+        for name in ("learn_budget.py", "budget_head.py", "budget.py", "budget_loop.py", "run_points.py", "preflight.py"):
             source.update((run_points.HERE / name).read_bytes())
         policy_sha = {p: hashlib.sha256((ckpt / "policies" / f"{run_points.level_name(p)}.pkl").read_bytes()).hexdigest()
                       for p in paths}
@@ -442,10 +443,21 @@ def main():
         key = jax.random.key(3000)
         expected, expected_logs = jax.device_get(reference(cfg, jax.random.split(key, exp.n_levels), levels, flow,
                                                          jax.random.fold_in(key, 1_000_003)))
-        for k in controlled.keys() - {"mean_h", "mean_lam"}:
-            np.testing.assert_allclose(controlled[k], expected[k], atol=1e-6, rtol=1e-6, err_msg=k)
-        np.testing.assert_allclose(logs["action"], expected_logs["action"], atol=1e-6, rtol=1e-6)
-        atomic_json(exp.out / "preflight_pass.json", dict(pass_=True, seed=3000, pairs=exp.pairs.tolist()))
+        diagnostics = preflight.compare_rollouts(controlled, logs, expected, expected_logs, delay=a.delay)
+        atomic_json(exp.out / "preflight_diagnostics.json", diagnostics)
+        stamp(f"preflight diagnostics: {json.dumps(diagnostics, allow_nan=False)}")
+        if not diagnostics["passed"]:
+            trace_path = exp.out / "preflight_failure.npz"
+            tmp = trace_path.with_suffix(".tmp")
+            with tmp.open("wb") as f:
+                np.savez_compressed(f, **{f"controlled_{k}": v for k, v in controlled.items()},
+                                    **{f"reference_{k}": v for k, v in expected.items()},
+                                    **{f"controlled_log_{k}": logs[k] for k in ("action", "due", "end")},
+                                    **{f"reference_log_{k}": expected_logs[k] for k in ("action", "due", "end")})
+            os.replace(tmp, trace_path)
+            raise AssertionError("Preflight failed:\n" + "\n".join(diagnostics["failures"]))
+        atomic_json(exp.out / "preflight_pass.json", dict(passed=True, seed=3000, pairs=exp.pairs.tolist(),
+                                                          diagnostics=diagnostics))
         stamp("preflight PASS: controller holding a constant budget matches the existing RTC loop")
         return
     fixed_ids = exp.select_fixed()
