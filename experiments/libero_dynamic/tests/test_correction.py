@@ -123,17 +123,25 @@ def simulate(control, cls, T, K, latency=0.175, threshold=10):
         a, orig, *_ = actions.next_action()
         executed.append(float(a[0]))
         originals.append(float(orig[0]))
+    # The runner submits even when the reply would arrive beyond T. Its default
+    # close may cancel that final future before the fake client's log is written.
+    # Finish the call for deterministic inspection; do not tick/merge after T.
+    if ctrl.future is not None:
+        ctrl.future.result()
     ctrl.close()
     return ctrl, log, np.array(executed), np.array(originals)
 
 
 @needs_runner
-def test_offline_schedule_matches_rtc_queue_k10():
+@pytest.mark.parametrize("T", [79, 80, 81, 83])
+def test_offline_schedule_matches_rtc_queue_k10(T):
     control, rtc_queue, _ = runner_modules()
-    T, K, d = 80, 10, 4
+    K, d = 10, 4
     _, log, executed, _ = simulate(control, rtc_queue.RtcQueueController, T, K)
     sched = common.request_schedule(T, d, 4)
-    assert [x["step"] for x in log] == [t for t, _ in sched][: len(log)]
+    assert [x["step"] for x in log] == list(range(0, T, 4))
+    assert [x["step"] for x in log if x["step"] + d < T] == [t for t, _ in sched]
+    assert log[-1]["step"] + d >= T  # paid request, no action from its reply within the episode
     assert all(x["delay"] == d for x in log)
     for k, (t_r, s) in enumerate(sched):
         for t in common.executed(T, t_r, s, d):
@@ -150,7 +158,8 @@ def test_offline_schedule_matches_lower_threshold():
     T, K, d, q = 90, 16, 4, 4
     _, log, executed, _ = simulate(control, rtc_queue.RtcQueueController, T, K, threshold=q)
     sched = common.request_schedule(T, d, d + K - d - q)
-    assert [x["step"] for x in log] == [t for t, _ in sched][: len(log)]
+    assert [x["step"] for x in log] == list(range(0, T, K - q))
+    assert [x["step"] for x in log if x["step"] + d < T] == [t for t, _ in sched]
     for k, (t_r, s) in enumerate(sched):
         for t in common.executed(T, t_r, s, d):
             assert executed[t] == pytest.approx(code(k, t - t_r))
