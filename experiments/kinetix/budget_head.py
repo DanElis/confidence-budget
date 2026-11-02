@@ -4,7 +4,7 @@ Actions are (s_k, r_{k+1}). Decisions use the request's observation and generate
 chunk; r_{k+1} is the soft window of the next request. Monte Carlo returns use
 gamma=1 in CONTROL TIME, not one discount per variably sized chunk.
 With before_inference=True, inputs exclude the new chunk entirely and the
-chosen r belongs to the CURRENT generation; the driver fixes s in that mode.
+chosen r belongs to the CURRENT generation; s can be fixed or adaptive.
 """
 
 from __future__ import annotations
@@ -20,6 +20,22 @@ def action_pairs(horizon: int, delay: int, strides: tuple[int, ...]) -> np.ndarr
     if any(s < max(delay, 1) or s + delay > horizon for s in strides):
         raise ValueError("need max(d, 1) <= s <= H-d")
     return np.asarray([(s, r) for s in strides for r in range(horizon - delay - s + 1)], np.int32)
+
+
+def current_action_pairs(horizon, delay, strides):
+    """Current r depends on OLD plan age, not on the newly chosen next stride."""
+    action_pairs(horizon, delay, tuple(strides))  # validate strides
+    return np.asarray([(s, r) for s in strides for r in range(horizon - delay + 1)], np.int32)
+
+
+def current_valid(pairs, age, horizon, delay):
+    # Clamp for inactive rows after termination; live requests must retain d actions.
+    remaining_soft = jnp.maximum(horizon - age - delay, 0)
+    return pairs[:, 1] <= remaining_soft[..., None]
+
+
+def masked_logits(logits, valid):
+    return jnp.where(valid, logits, -1e9)
 
 
 def features(t, obs, chunk, leftover, age, old_mask, *, delay: int, total_steps: int):
@@ -71,11 +87,16 @@ def make_planner(delay: int, total_steps: int, record_features: bool = True, bef
         else:
             x = features(t, obs, chunk, leftover, age, old_mask, delay=delay, total_steps=total_steps)
         logits, value = forward(ctrl["net"], x, ctrl["mean"], ctrl["std"])
+        valid = (current_valid(ctrl["pairs"], age, leftover.shape[2], delay) if before_inference
+                 else jnp.ones_like(logits, dtype=bool))
+        logits = masked_logits(logits, valid)
         lp = jax.nn.log_softmax(logits)
         k = jax.random.fold_in(key, t)
         sampled = jax.random.categorical(k, logits).astype(jnp.int32)
         marginal = jnp.broadcast_to(ctrl["marginal"][:, None], logits.shape)
-        random_id = jax.random.categorical(k, jnp.log(jnp.maximum(marginal, 1e-30))).astype(jnp.int32)
+        marginal = jnp.where(valid, marginal, 0)
+        marginal = jnp.where(marginal.sum(-1, keepdims=True) > 0, marginal, valid.astype(jnp.float32))
+        random_id = jax.random.categorical(k, masked_logits(jnp.log(jnp.maximum(marginal, 1e-30)), valid)).astype(jnp.int32)
         ids = jnp.where(ctrl["mode"] == 1, jnp.argmax(logits, -1), sampled)
         ids = jnp.where(ctrl["mode"] == 2, ctrl["fixed"][:, None], ids)
         ids = jnp.where(ctrl["mode"] == 3, random_id, ids).astype(jnp.int32)
@@ -83,7 +104,7 @@ def make_planner(delay: int, total_steps: int, record_features: bool = True, bef
         logs = dict(head_id=ids)
         if record_features:
             logs.update(head_x=x, head_logp=jnp.take_along_axis(lp, ids[..., None], -1)[..., 0],
-                        head_value=value, head_s=pair[..., 0])
+                        head_value=value, head_s=pair[..., 0], head_valid=valid)
         return pair[..., 0], delay + pair[..., 1], logs
     return choose
 
@@ -147,6 +168,8 @@ def training_batch(result, logs, *, call_cost, smooth_cost, reference_stride, de
     batch = dict(x=np.asarray(logs["head_x"])[valid], action=np.asarray(logs["head_id"])[valid],
                  old_logp=np.asarray(logs["head_logp"])[valid], target=target, advantage=adv,
                  actor_scale=np.full(len(target), actor_scale, np.float32))
+    if "head_valid" in logs:
+        batch["action_valid"] = np.asarray(logs["head_valid"])[valid]
     if not len(target) or any(not np.all(np.isfinite(v)) for v in batch.values()):
         raise ValueError("empty or non-finite PPO batch; results were not saved")
     return batch
@@ -154,6 +177,8 @@ def training_batch(result, logs, *, call_cost, smooth_cost, reference_stride, de
 
 def loss(net, batch, mean, std, *, clip=0.2, entropy_coef=0.01):
     logits, value = forward(net, batch["x"], mean, std)
+    if "action_valid" in batch:
+        logits = masked_logits(logits, batch["action_valid"])
     lp = jax.nn.log_softmax(logits)
     logp = jnp.take_along_axis(lp, batch["action"][:, None], -1)[:, 0]
     ratio = jnp.exp(jnp.clip(logp - batch["old_logp"], -20, 20))

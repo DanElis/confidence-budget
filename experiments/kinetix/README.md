@@ -1,5 +1,43 @@
 # Learned adaptive budget on Kinetix
 
+## Joint current (s,r) from fresh state
+
+`night_joint.sh` implements the joint BEFORE-generation controller. At request
+time t it receives fresh o_t, aligned OLD leftover Y, plan age, delay, previous
+mask, elapsed time and level identity. A single categorical actor chooses both
+s (next request starts at t+s) and r (CURRENT RTC soft window). Then exactly one
+chunk is generated. The actor never consumes the new chunk. The observation
+used to build the old plan is optional in the design and is not an input in
+this implementation.
+
+The two bounds belong to different plans: d<=s<=H-d, 0<=r<=H-age-d at a valid
+request. The old s+r<=H-d constraint is NOT imposed on the actor. For example,
+H=8,d=2 permits s=4,r=4 after previous stride 2, but r=4 is invalid after stride
+4. The actor's sampling, entropy and PPO log-probabilities use the same stored
+per-decision feasibility mask. Inactive rows use a harmless fallback; they are
+excluded from training and outcome metrics.
+
+Constant references are evaluated only for pairs satisfying s+r+d<=H: these
+must remain feasible after repeating their OWN stride. Other joint pairs have
+null validation scores in fixed_selection.json. Marginal-random controls are
+renormalised over currently feasible choices, so their distribution may depend
+on previous choices/age, but not on fresh environment observations.
+
+Default Kinetix pilot: d=2, strides {2,4}, 14 joint candidates with dynamically
+valid r; two levels, one model seed, eight updates, training-loop budget one
+hour (checks/compilation/evaluation add time). This is a routing/learning pilot
+on H=8, not the proposed future transfer to longer-horizon Robomimic or
+FurnitureBench. Use a NEW output directory; older checkpoints are incompatible.
+
+```bash
+tmux new-session -d -s joint-before 'cd ~/work/cv/confidence-budget/experiments/kinetix && bash night_joint.sh night'
+```
+
+Output: `runs/learned_joint_before_d2/experiment/report.md`; shell log:
+`runs/learned_joint_before_d2/night.log`. Use `diagnose` instead of `night` for
+preflight without training. Local tests have not been run; the server script
+runs the CPU suite, deterministic GPU checks and smoke first.
+
 ## Fresh-state mask experiment (new)
 
 `night_mask.sh` is the new pilot: fixed s=4, d=2, H=8, learn only r in {0,1,2}.

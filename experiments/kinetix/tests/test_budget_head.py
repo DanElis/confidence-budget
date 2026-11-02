@@ -117,7 +117,8 @@ def test_before_generation_constant_mask_matches_fixed_rtc(r):
     np.testing.assert_array_equal(actual["n_infer"], expected["n_infer"])
     assert logs["head_x"].shape[-1] == 2 + 8 + 4 + 2
     sampled, logs1 = fake_run(cfg, head.constant_actor(dict(ctrl, mode=jnp.asarray(0, jnp.int32))), before=True)
-    np.testing.assert_array_equal(logs["head_id"], logs1["head_id"])
+    due = np.asarray(logs["due"], bool)
+    np.testing.assert_array_equal(np.asarray(logs["head_id"])[due], np.asarray(logs1["head_id"])[due])
     np.testing.assert_allclose(logs["action"], logs1["action"], atol=1e-6)
 
 
@@ -133,6 +134,34 @@ def test_fresh_mask_changes_current_generation_without_a_second_call():
     assert not np.allclose(logs["action"][6], base["action"][6])  # request at 4, arrives at 6
     np.testing.assert_array_equal(np.flatnonzero(np.asarray(logs["due"])[:, 0, 0]), np.arange(0, 25, 4))
     np.testing.assert_array_equal(result["n_infer"], np.full((2, 3), 8))  # warm start + seven requests
+
+
+def test_current_mask_bound_depends_on_previous_age_not_new_stride():
+    pairs = head.current_action_pairs(8, 2, (2, 4))
+    i = int(np.flatnonzero(np.all(pairs == [4, 4], axis=1))[0])
+    valid = np.asarray(head.current_valid(jnp.asarray(pairs), jnp.array([[2, 4]]), 8, 2))
+    assert valid[0, 0, i]  # old plan has 6 actions left; 2 frozen + 4 soft
+    assert not valid[0, 1, i]  # old plan has only 4 actions left
+
+
+def test_joint_before_actor_masks_invalid_actions_and_records_the_training_mask():
+    pairs = head.current_action_pairs(8, 2, (2, 4))
+    dim = 2 + 8 + 4 + 2
+    net = head.init_network(jax.random.key(40), dim, len(pairs), width=8, n_levels=2)
+    ctrl = head.control(net, dim, pairs, 2)
+    _, logs = fake_run(budget.LoopConfig(d=2, s=2, guidance=True), ctrl, before=True)
+    due = np.asarray(logs["due"], bool)
+    x = np.asarray(logs["head_x"])[due]
+    ids = np.asarray(logs["head_id"])[due]
+    valid = np.asarray(logs["head_valid"])[due]
+    assert np.all(valid[np.arange(len(ids)), ids])
+    age = np.rint(x[:, -5] * 8).astype(int)
+    assert np.all(pairs[ids, 1] <= 8 - age - 2)
+    # PPO must recompute the SAME masked distribution as the rollout.
+    lp = jax.nn.log_softmax(head.masked_logits(head.forward(ctrl["net"], jnp.asarray(x), ctrl["mean"], ctrl["std"])[0],
+                                               jnp.asarray(valid)))
+    got = np.asarray(jnp.take_along_axis(lp, jnp.asarray(ids)[:, None], -1))[:, 0]
+    np.testing.assert_allclose(got, np.asarray(logs["head_logp"])[due], atol=1e-6)
 
 
 def test_control_time_rewards_ignore_actions_after_termination():

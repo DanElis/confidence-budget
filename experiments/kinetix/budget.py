@@ -314,8 +314,8 @@ def run_loop(
         chunk, disp, sel, s, end, h, lam = new
         if before is not None:
             s, end, extra = before
-            h = s + end
-            lam = (s - d) / jnp.maximum(h - 2 * d, 1)
+            h = off + end  # endpoint in the OLD chunk; independent of the NEW stride
+            lam = jnp.zeros_like(s, dtype=jnp.float32)
         if plan_fn is not None:
             s, end, extra = plan_fn(t, c["obs"], chunk, leftover, off, c["next_mask"])
             h = s + end  # effective commitment, not a calibrated confidence horizon

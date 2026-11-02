@@ -108,7 +108,8 @@ class Experiment:
             env, ep, obs_dim, action_dim, args.train_envs, args.train_envs,
             planner=head.make_planner(args.delay, self.total_steps, before_inference=args.mask_before),
             before_inference=args.mask_before)
-        self.pairs = head.action_pairs(self.horizon, args.delay, tuple(args.strides))
+        self.pairs = (head.current_action_pairs(self.horizon, args.delay, tuple(args.strides))
+                      if args.mask_before and len(args.strides) > 1 else head.action_pairs(self.horizon, args.delay, tuple(args.strides)))
         self.inputs = obs_dim + (1 if args.mask_before else 2) * self.horizon * action_dim + 4 + self.n_levels
         self.base = budget.LoopConfig(d=args.delay, s=args.reference_stride, guidance=True,
                                      mask_end=self.horizon - args.reference_stride)
@@ -141,7 +142,7 @@ class Experiment:
                 raise RuntimeError("experiment configuration/source/checkpoint changed; choose a NEW --out directory")
         else:
             atomic_json(manifest, dict(identity=identity, git_commit=revision,
-                                      primary=("learned current r vs validation-selected fixed r, same fixed stride" if args.mask_before else
+                                      primary=("learned current r vs validation-selected fixed r, same fixed stride" if args.mask_before and len(args.strides) == 1 else
                                                "mean paired SR difference vs per-model per-level frequency-matched fixed budget selected on validation"),
                                       seed_protocol="training >=10000, validation 1000.., test 2000..; no test-based selection",
                                       notes="state-based policy; fixed set of levels; simulated d independent of wall time"))
@@ -196,6 +197,13 @@ class Experiment:
         """The reference is selected on validation, separately per task. Never on test."""
         scores, rates, successes = [], [], []
         for i, (s, r) in enumerate(self.pairs):
+            # A constant pair repeats its own stride. Current-mask actor pairs can
+            # be valid only after a different previous stride; exclude these from constants.
+            if self.a.mask_before and s + r + self.a.delay > self.horizon:
+                scores.append(np.full(self.n_levels, -np.inf))
+                rates.append(np.full(self.n_levels, np.inf))
+                successes.append(np.full(self.n_levels, -np.inf))
+                continue
             controller = self.fixed_controller(np.full(self.n_levels, i, np.int32))
             result, _ = self.evaluate(controller, f"val_fixed_s{s}_r{r}", self.a.val_seeds)
             scores.append(objective(result, self.a, self.total_steps).mean(1))
@@ -205,7 +213,8 @@ class Experiment:
         ids = np.argmax(np.asarray(scores), axis=0).astype(np.int32)
         self.fixed_ids = ids
         atomic_json(self.out / "fixed_selection.json", dict(levels=self.names, action_ids=ids.tolist(),
-                    pairs=self.pairs[ids].tolist(), validation_scores=np.asarray(scores).tolist()))
+                    pairs=self.pairs[ids].tolist(), validation_scores=[
+                        [float(x) if np.isfinite(x) else None for x in row] for row in scores]))
         stamp(f"validation-selected fixed budgets: {dict(zip(self.names, self.pairs[ids].tolist()))}")
         return ids
 
@@ -213,7 +222,7 @@ class Experiment:
         """Best validation SR among constants within 5% of the learned validation rate;
         otherwise nearest rate. The test report flags any remaining cost mismatch.
         """
-        if self.a.mask_before:
+        if self.a.mask_before and len(self.a.strides) == 1:
             return self.fixed_ids.copy()
         target = (result["n_infer"] / np.maximum(result["elapsed"], 1)).mean(1)
         relative_error = np.abs(self.grid_rates / target[None] - 1)
@@ -333,18 +342,19 @@ def report(exp, fixed, learned, random_controls, matched_refs):
     selected_steps = {seed: json.loads((exp.out / f"model_{seed}" / "done.json").read_text())["selected_step"]
                       for seed in a.model_seeds[:len(learned)]}
     lines = ["# Learned budget on Kinetix", "",
-             (f"CURRENT-mask experiment: fixed s={a.reference_stride}; choose r BEFORE generation from fresh observation and OLD leftover. "
-              "No new-chunk features; reference is validation-selected fixed r at the same stride."
+             (f"CURRENT-mask experiment: strides={a.strides}; choose (s,r) BEFORE generation from fresh observation and OLD leftover. "
+              "No new-chunk features; invalid current masks are excluded using old-plan age."
               if a.mask_before else "Original experiment: choose s and NEXT mask after generation."), "",
              f"Frozen public flow policies, H={exp.horizon}, d={a.delay}; levels={len(exp.names)}. "
              f"Evaluated model seeds={a.model_seeds[:len(learned)]}; held-out test RNGs={a.test_seeds}. "
              f"{'COMPLETE' if len(learned) == len(a.model_seeds) else 'PARTIAL: some model seeds still pending'}.", "",
              f"Selected checkpoint iterations (validation only): {selected_steps}.", "",
-             ("The primary reference is the per-level fixed r selected ONLY on validation, with the same fixed stride. " if a.mask_before else
+             ("The primary reference is the per-level fixed r selected ONLY on validation, with the same fixed stride. " if a.mask_before and len(a.strides) == 1 else
               "The primary reference is a per-model, per-level constant (s,r) selected ONLY on validation to match the learned call rate. ") +
              "The global fixed reference in the table is selected by the training objective, separately per level. "
              "Marginal-random controls use each learned model's per-level action frequencies on validation. "
-             "They remove state dependence but do not enforce exactly equal test cost. "
+             "They remove environment-observation dependence; current-mask feasibility still depends on old-plan age. "
+             "They do not enforce exactly equal test cost. "
              "All policies use identical reset/action-noise streams and flow batches on the same test items.", "",
              "| policy | SR % | paired delta vs fixed, pp [95% CI] | calls/ep | calls/tick | mean step | mean action change |",
              "|---|---|---|---|---|---|---|"]
@@ -371,7 +381,7 @@ def report(exp, fixed, learned, random_controls, matched_refs):
                                 - np.stack([r["solved"] for r in random_controls])))
     primary = paired_ci(100 * (np.stack([r["solved"] for r in learned])
                               - np.stack([r["solved"] for r in matched_refs])))
-    primary_name = "learned r vs fixed r at the same stride" if a.mask_before else "learned vs frequency-matched fixed"
+    primary_name = "learned r vs fixed r at the same stride" if a.mask_before and len(a.strides) == 1 else "learned vs frequency-matched fixed"
     lines += ["", f"PRIMARY {primary_name}: {primary[0]:+.2f} pp [{primary[1]:+.2f}; {primary[2]:+.2f}].",
               f"State-dependent vs marginal-random (exploratory): {m:+.2f} pp [{lo:+.2f}; {hi:+.2f}].",
               "CI resamples training seeds and episodes within the FIXED levels; it does not establish transfer to new levels. "
@@ -411,7 +421,7 @@ def main():
     p.add_argument("--delay", type=int, default=2)
     p.add_argument("--strides", type=int, nargs="+", default=[2, 3, 4])
     p.add_argument("--reference-stride", type=int, default=2)
-    p.add_argument("--mask-before", action="store_true", help="choose current RTC mask BEFORE generation; requires one fixed stride")
+    p.add_argument("--mask-before", action="store_true", help="choose current r and next request stride BEFORE generation")
     p.add_argument("--train-envs", type=int, default=32)
     p.add_argument("--eval-envs", type=int, default=256)
     p.add_argument("--iterations", type=int, default=40)
@@ -453,8 +463,6 @@ def main():
         p.error("iterations must be <100000 (disjoint model training RNG ranges)")
     if a.reference_stride not in a.strides:
         p.error("reference-stride must be one of --strides")
-    if a.mask_before and len(a.strides) != 1:
-        p.error("--mask-before requires exactly one fixed --strides value")
     if not any(d.platform == "gpu" for d in jax.devices()):
         raise SystemExit("GPU required for real-model runs; use the CPU pytest preflight for synthetic tests")
     exp = Experiment(a)
@@ -466,7 +474,7 @@ def main():
             return
         # Scientific comparisons all use exp.eval_fn, including fixed controls.
         # Verify sampled-actor mode against fixed mode in that SAME executable.
-        check_r = int(exp.pairs[:, 1].max()) if a.mask_before else 0
+        check_r = exp.horizon - a.delay - a.reference_stride if a.mask_before else 0
         ids = np.full(exp.n_levels, np.flatnonzero((exp.pairs == (a.reference_stride, check_r)).all(1))[0], np.int32)
         cfg = dataclasses.replace(exp.base, mask_end=a.delay + check_r)
         constant = head.constant_actor(exp.fixed_controller(ids))
