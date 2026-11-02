@@ -153,6 +153,13 @@ class Server:
 
         self.rule = HStarRule("above", eta=args.eta, k=1, min_h=1)
         self.log = open(args.log_jsonl, "a") if args.log_jsonl else None
+        self.budget = None
+        if args.budget_head:
+            from budget_runtime import BudgetRuntime
+
+            self.policy.eval().requires_grad_(False)
+            self.budget = BudgetRuntime(args.budget_head, args.budget_traces, args.budget_mode,
+                                        args.budget_fixed, args.budget_seed, args.device)
 
     @property
     def metadata(self) -> dict:
@@ -164,7 +171,9 @@ class Server:
                 "rule": a.rule, "eta": a.eta, "aac_min_h": a.aac_min_h, "s_min": a.s_min, "s_max": a.s_max,
                 "trans_len": a.trans_len, "trans_ref": a.trans_ref, "trans_power": a.trans_power,
                 "trans_min": a.trans_min, "trans_max": a.trans_max, "trans_window": a.trans_window,
-                "fresh_t": a.fresh_t, "return_latent": a.return_latent}
+                "fresh_t": a.fresh_t, "return_latent": a.return_latent,
+                "budget_head": a.budget_head, "budget_mode": a.budget_mode,
+                "budget_seed": a.budget_seed, "budget_fixed": a.budget_fixed}
 
     def batch(self, obs: dict) -> dict:
         return self.pre({"observation.images.image": as_image(obs["observation/image"]),
@@ -183,6 +192,12 @@ class Server:
         if scale != 1.0 and (self.rtc is None or a.n_samples != 1 or a.mask_mode != "rtc"):
             raise ValueError("rtc_scale needs --mode rtc with one sample and the plain RTC mask")
         plan: dict[str, Any] = {"sel": 0}
+        decision = None
+        if getattr(self, "budget", None) is not None:
+            raw_left = np.asarray(obs.get("prev_chunk_left_over", []), np.float32).reshape(-1, ACTION_DIM)
+            decision = self.budget.choose(obs, state, raw_left, delay, self.horizon)
+            mask_end = torch.tensor([delay + decision["r"]])
+            plan.update(s=decision["s"], r=decision["r"], len=self.horizon)
         latent = None
         with torch.no_grad():
             if a.mask_mode == "transition":
@@ -201,6 +216,10 @@ class Server:
         chunk = chunk[:, : int(plan.get("len", self.apc))]
         original = chunk[0].detach().cpu().numpy().astype(np.float32)
         actions = torch.stack([self.post(chunk[:, i, :]) for i in range(chunk.shape[1])], dim=1)
+        if decision is not None:
+            if str(dev).startswith("cuda"):
+                decision["gpu_peak_allocated_mb"] = torch.cuda.max_memory_allocated(dev) / 2**20
+            out["budget"] = decision
         return {"actions": actions[0].detach().cpu().numpy().astype(np.float32), "original_actions": original,
                 "plan": plan, **out}
 
@@ -425,7 +444,16 @@ def parse_args(argv=None):
     p.add_argument("--log-jsonl", default=None, help="append per-request signals (z, dispersion, plan) here")
     p.add_argument("--return-latent", action="store_true",
                    help="one sample: also return the prefix latent and the full chunk (correction head)")
+    p.add_argument("--budget-head", default=None)
+    p.add_argument("--budget-traces", default=None)
+    p.add_argument("--budget-mode", choices=["sample", "greedy", "fixed", "random"], default="sample")
+    p.add_argument("--budget-fixed", default="8,4")
+    p.add_argument("--budget-seed", type=int, default=0)
     args = p.parse_args(argv)
+    if args.budget_head and (args.mode != "rtc" or args.n_samples != 1 or args.mask_mode != "rtc"
+                             or args.adaptive or args.return_latent or not args.budget_traces
+                             or args.actions_per_chunk != 50):
+        p.error("--budget-head requires plain single-sample RTC, --actions-per-chunk 50 and --budget-traces")
     if args.return_latent and (args.n_samples != 1 or args.mask_mode != "rtc"):
         p.error("--return-latent needs one sample and the plain RTC mask")
     if args.adaptive and args.n_samples < 2:

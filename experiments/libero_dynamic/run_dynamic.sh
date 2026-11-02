@@ -45,6 +45,8 @@ SPEEDS=${SPEEDS:-"0.03 0.06 0.09"}
 LEVELS=${LEVELS:-"l1 l2 l3"}
 TRAJ=${TRAJ:-"0 1 2 3 4"}
 LIMIT=${LIMIT:-}
+START_INDEX=${START_INDEX:-0}
+MAX_STEPS=${MAX_STEPS:-600}
 SERVERS=${SERVERS:-4}
 WORKERS=${WORKERS:-8}
 PORT=${PORT:-8124}
@@ -132,12 +134,12 @@ assert n > 0, "no alpha_mps found"
 print(f"speed {speed}: patched {n} alpha_mps entries")
 PY
   extra=()
-  [[ -n $LIMIT ]] && extra=(--start-index 0 --limit "$LIMIT")
+  [[ -n $LIMIT ]] && extra=(--start-index "$START_INDEX" --limit "$LIMIT")
   echo "$(date '+%F %T') start $NAME v=$v"
   (cd "$DYN" && "$DPY" "scripts/run_pi05_${STRATEGY}_eval.py" --config-dir "$cfg" --output-dir "$OUT/v$v" \
      --levels $LEVELS --traj-indices $TRAJ --num-workers "$WORKERS" --policy openpi_ws --openpi-host 127.0.0.1 \
      --openpi-port "$PORT" --policy-server-count "$SERVERS" --per-worker-policy-endpoint \
-     --latency-source fixed --calibrated-latency-seconds "$LATENCY" --replan-steps "$K" --max-steps 600 \
+     --latency-source fixed --calibrated-latency-seconds "$LATENCY" --replan-steps "$K" --max-steps "$MAX_STEPS" \
      --stop-on-success --no-save-videos --no-save-model-input-videos --no-save-step-trace --camera-size 256 \
      "${extra[@]}" ${RUNNER_ARGS:-}) > "$OUT/eval_v$v.log" 2>&1 || { rc=1; echo "eval failed, see $OUT/eval_v$v.log"; tail -20 "$OUT/eval_v$v.log"; break; }
   "$DPY" - "$OUT/v$v" <<'PY'
