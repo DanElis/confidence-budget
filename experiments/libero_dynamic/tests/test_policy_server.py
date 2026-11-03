@@ -62,12 +62,10 @@ def test_cli_checks():
 
 def make_planner(**kw):
     """Server with only what plan_step needs (no model)."""
-    from hstar import HStarRule
-
     args = ps.parse_args(["--mode", "rtc", "--n-samples", "4", "--adaptive", *kw.pop("argv", [])])
     srv = ps.Server.__new__(ps.Server)
     srv.args, srv.horizon = args, 50
-    srv.rule = HStarRule("above", eta=args.eta, k=1, min_h=1)
+    srv.rule = ps.step_rule(args)
     return srv
 
 
@@ -108,6 +106,60 @@ def test_plan_step_aac():
     disp = np.r_[np.full(10, 0.1), np.full(40, 1.0)]
     assert srv.plan_step(None, 4, disp) == (10, 6)  # works on the first chunk too: needs only the new samples
     assert srv.plan_step(np.zeros(50), 4, np.full(50, 0.25))[1] == 4  # flat (exact in binary): h* = 1, s = s_min
+
+
+def test_plan_step_from_dispersion():
+    srv = make_planner(argv=["--rule", "disp", "--eta", "0.5", "--s-max", "20"])
+    disp = np.r_[np.zeros(20), np.ones(30)]
+    assert srv.plan_step(None, 4, disp) == (19, 15)  # first chunk too; k = 3: the mean over 19..21 is 2/3
+    assert srv.plan_step(None, 4, np.zeros(50)) == (50, 20)  # never reaches eta: s_max
+    assert srv.plan_step(None, 4, np.ones(50)) == (1, 4)  # already above: s_min = d
+
+
+# ---------------------------------------------------------------- no guidance
+
+def make_unguided_server(monkeypatch):
+    import shared_prefix
+
+    args = ps.parse_args(["--mode", "rtc", "--n-samples", "4", "--no-guidance", "--adaptive", "--rule", "disp",
+                          "--eta", "0.1", "--s-max", "20", "--device", "cpu"])
+    srv = ps.Server.__new__(ps.Server)
+    srv.args, srv.horizon, srv.a_max, srv.apc, srv.exec_h = args, 50, 32, 10, 10
+    srv.policy, srv.rtc, srv.log, srv.rule = None, FakeRTC(), None, ps.step_rule(args)
+    calls = []
+
+    def fake_predict(policy, batch, repeats, noise, **kw):
+        calls.append(dict(kw, repeats=repeats, weights=srv.rtc.weight_override))
+        out = torch.zeros(repeats, 50, 32)
+        out[:, 30:] = noise[:, 30:]  # the samples agree up to index 30
+        return out
+
+    monkeypatch.setattr(shared_prefix, "predict_chunk_shared", fake_predict)
+    return srv, calls
+
+
+def test_no_guidance_executes_sample_0_without_rtc_and_sets_the_step(monkeypatch):
+    srv, calls = make_unguided_server(monkeypatch)
+    torch.manual_seed(0)
+    noise = torch.randn(1, 50, 32)
+    state = {}
+    chunk, plan = srv.infer_samples({}, noise, None, 0, 0, torch.tensor([10]), state)
+    assert plan == {"sel": 0, "h_star": 28, "s": 20, "len": 20} and torch.equal(state["full"], chunk[0])
+    left, left_len = ps.leftover_tensor({"prev_chunk_left_over": np.zeros((10, 7), np.float32)}, 50)
+    chunk, plan = srv.infer_samples({}, noise, left, left_len, 4, torch.tensor([10]), state)
+    # no guidance arguments, no guided rows; the executed row is the first noise; s = h* - d, the chunk returned is s + d
+    assert calls[-1] == {"repeats": 4, "weights": None}
+    assert plan == {"sel": 0, "h_star": 28, "s": 20, "len": 24}
+    torch.testing.assert_close(chunk[0, 30:], noise[0, 30:])
+
+
+def test_no_guidance_cli_checks():
+    ok = ["--mode", "rtc", "--n-samples", "4", "--no-guidance"]
+    ps.parse_args(ok)
+    for bad in (["--n-samples", "4", "--no-guidance", "--mode", "plain"], ["--mode", "rtc", "--no-guidance"],
+                ok + ["--select", "coherent"], ok + ["--mask-mode", "conf"]):
+        with pytest.raises(SystemExit):
+            ps.parse_args(bad)
 
 
 # ---------------------------------------------------------------- transition mask

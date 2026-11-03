@@ -15,6 +15,8 @@ Differences from their server, all opt-in except the noise:
   share it while their trajectories coincide (paired comparisons);
 * --n-samples K > 1 (RTC only): K unguided + K guided rows in one call with a shared prefix
   (libero_pro/selection.py, shared_prefix.py): --select coherent|medoid, --mask-mode rtc_x_conf|conf;
+* --no-guidance (K > 1, the runner's rtc_queue): K unguided rows, sample 0 executed, the leftover is read only for the
+  agreement signal. With --adaptive this is the step alone, with naive switching and no RTC;
 * --mask-mode transition (RTC, one sample): before denoising, the old plan is checked under the new observation
   (one extra expert pass on the cached prefix, selection.plan_residual) and the RTC mask becomes an exponential
   transition whose length grows with the old plan's deviation near the stitch (selection.transition_weights):
@@ -120,6 +122,13 @@ def leftover_tensor(obs: dict, horizon: int) -> tuple[torch.Tensor | None, int]:
     return out, len(left)
 
 
+def step_rule(args):
+    """h* rule of --adaptive: --rule disp smooths as in the dispersion runs of libero_pro and robotwin (k = 3)."""
+    from hstar import HStarRule
+
+    return HStarRule("above", eta=args.eta, k=3 if args.rule == "disp" else 1, min_h=1)
+
+
 def aac_h_star(disp: np.ndarray, min_h: int = 1) -> int:
     """AAC [13] Eq. 5 on a per-action dispersion profile: h* = max(argmax_h (D_{h+1} - D_h), min_h)."""
     horizon = len(disp)
@@ -149,9 +158,7 @@ class Server:
             policy_cfg=self.policy.config, pretrained_path=args.policy,
             preprocessor_overrides={"device_processor": {"device": args.device}},
             postprocessor_overrides={"device_processor": {"device": "cpu"}})
-        from hstar import HStarRule
-
-        self.rule = HStarRule("above", eta=args.eta, k=1, min_h=1)
+        self.rule = step_rule(args)
         self.log = open(args.log_jsonl, "a") if args.log_jsonl else None
         self.budget = None
         if args.budget_head:
@@ -172,7 +179,7 @@ class Server:
         a = self.args
         return {"policy": "confidence_budget_pi05", "checkpoint": a.policy, "actions_per_chunk": self.apc,
                 "rtc_conditioning_supported": a.mode == "rtc", "rtc_execution_horizon": self.exec_h,
-                "n_samples": a.n_samples, "select": a.select, "mask_mode": a.mask_mode,
+                "n_samples": a.n_samples, "select": a.select, "mask_mode": a.mask_mode, "no_guidance": a.no_guidance,
                 "conf_sigma": a.conf_sigma, "conf_ref": a.conf_ref, "seed": a.seed, "adaptive": a.adaptive,
                 "rule": a.rule, "eta": a.eta, "aac_min_h": a.aac_min_h, "s_min": a.s_min, "s_max": a.s_max,
                 "trans_len": a.trans_len, "trans_ref": a.trans_ref, "trans_power": a.trans_power,
@@ -347,10 +354,12 @@ class Server:
         if a.adaptive:  # the old plan beyond the returned s + d actions (soft mask, agreement)
             left, left_len, disp_start = self.old_plan(left, left_len, state)
         z = None
-        if left is None:  # first chunk of an episode: K unguided samples, sample 0 executed
+        if left is None or a.no_guidance:  # first chunk of an episode or no RTC: K unguided samples, sample 0 executed
             samples = predict_chunk_shared(self.policy, batch, k, noise=noise_k.to(dev)).float().reshape(1, k, self.horizon, -1)
             real = samples[..., :ACTION_DIM]
             chosen, sel = samples[:, 0], 0
+            if left is not None:
+                z = agreement(real, left[..., :ACTION_DIM].to(dev), torch.tensor([left_len]))[0].numpy()
         else:
             # dispersion of the previous chunk aligned with the leftover
             left_disp = None
@@ -398,6 +407,7 @@ class Server:
             the first chunk of an episode (no old plan) gets s_min.
         --rule aac:   h* = argmax_h (D_{h+1} - D_h), D_h = mean dispersion of the new samples over the first h
             actions (AAC [13], Eq. 5, with the dispersion in place of the action entropy), at least --aac-min-h.
+        --rule disp:  h* = first index where the smoothed dispersion of the new samples reaches eta, H if never.
 
         With the runner's --prefetch-threshold d, a chunk of length s + d is executed for s steps before the next
         request (its last d actions cover the next inference), so s is the replanning step."""
@@ -408,6 +418,10 @@ class Server:
             if disp is None:
                 return self.horizon, s_min
             h = aac_h_star(np.asarray(disp, dtype=np.float64), a.aac_min_h)
+        elif a.rule == "disp":
+            if disp is None:
+                return self.horizon, s_min
+            h = int(self.rule(disp, 0))
         else:
             if z is None:
                 return self.horizon, s_min
@@ -467,9 +481,11 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--adaptive", action="store_true",
                    help="replanning step from plan agreement; run the runner with --prefetch-threshold d")
-    p.add_argument("--rule", choices=["agree", "aac"], default="agree",
-                   help="adaptive: h* from plan agreement (z > eta) or from the growth of the samples' dispersion (AAC)")
-    p.add_argument("--eta", type=float, default=3.0, help="adaptive, agree: z threshold")
+    p.add_argument("--no-guidance", action="store_true", help="K samples without RTC guidance (see the module docstring)")
+    p.add_argument("--rule", choices=["agree", "aac", "disp"], default="agree",
+                   help="adaptive: h* from plan agreement (z > eta), the growth of the samples' dispersion (AAC) "
+                        "or the samples' dispersion reaching eta")
+    p.add_argument("--eta", type=float, default=3.0, help="adaptive, agree / disp: threshold")
     p.add_argument("--aac-min-h", type=int, default=1, help="adaptive, aac: lower bound of h*")
     p.add_argument("--s-min", type=int, default=None, help="adaptive: lower bound of s (default d)")
     p.add_argument("--s-max", type=int, default=20, help="adaptive: upper bound of s")
@@ -508,6 +524,9 @@ def parse_args(argv=None):
         p.error("--n-samples > 1 needs --mode rtc (selection and the mask use the old plan)")
     if args.mask_mode == "transition" and (args.mode != "rtc" or args.n_samples != 1 or args.adaptive):
         p.error("--mask-mode transition needs --mode rtc and one sample")
+    if args.no_guidance and (args.mode != "rtc" or args.n_samples < 2 or args.select != "first" or args.mask_mode != "rtc"
+                             or args.return_latent or args.budget_head or args.option_budget):
+        p.error("--no-guidance needs --mode rtc (the runner's queue) and K > 1, without selection, masks or budgets")
     if not 0 < args.fresh_t < 1:
         p.error("--fresh-t must be in (0, 1)")
     if args.n_samples == 1 and (args.select != "first" or args.mask_mode not in ("rtc", "transition")):

@@ -18,6 +18,8 @@ chosen noise is then generated once more with RTC.
     --mask-mode rtc_x_conf|conf --conf-sigma S --conf-ref R   RTC mask weighted by exp(-D_old / (S * R))
     --signal agreement --planner adaptive|budget --hstar-rule kind=above,eta=Z,k=1,min_h=1
                                                    h* = first index where the old plan leaves the new samples' cloud
+    --signal dispersion --planner adaptive --hstar-config F (calibrate_step.py)
+                                                   h* = first index where the samples' dispersion reaches eta
 
 Suites: stock LIBERO names (``libero_object``) and LIBERO-PRO position levels
 (``pos:x0.2``, ``pos:y0.1``, ``pos:all``). Results go to ``--out`` as one JSON
@@ -111,8 +113,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--shared-prefix", action="store_true",
                    help="K > 1: encode each observation's prefix once and repeat its KV cache over the samples "
                         "(shared_prefix.py) instead of repeating the observation")
-    p.add_argument("--signal", choices=["entropy", "agreement"], default="entropy",
-                   help="what the budget / adaptive planner's h* rule reads (agreement needs --n-samples > 1)")
+    p.add_argument("--signal", choices=["entropy", "agreement", "dispersion"], default="entropy",
+                   help="what the budget / adaptive planner's h* rule reads (agreement, dispersion need --n-samples > 1)")
     # outputs
     p.add_argument("--record-entropy", action="store_true", help="store cross-attention entropy of every chunk")
     p.add_argument("--save-actions", action="store_true", help="store executed actions (.npy)")
@@ -175,12 +177,12 @@ def check_sample_args(args) -> None:
     k = args.n_samples
     if k < 1:
         raise SystemExit("--n-samples must be >= 1")
-    if k == 1 and (args.select != "first" or args.mask_mode != "rtc" or args.signal == "agreement"):
-        raise SystemExit("--select, --mask-mode and --signal agreement need --n-samples > 1")
+    if k == 1 and (args.select != "first" or args.mask_mode != "rtc" or args.signal != "entropy"):
+        raise SystemExit("--select, --mask-mode and --signal agreement|dispersion need --n-samples > 1")
     if k > 1 and args.record_entropy:
         raise SystemExit("--record-entropy is not supported with --n-samples > 1")
-    if k > 1 and args.planner != "fixed" and args.signal != "agreement":
-        raise SystemExit("with --n-samples > 1 the budget / adaptive planner needs --signal agreement")
+    if k > 1 and args.planner != "fixed" and args.signal == "entropy":
+        raise SystemExit("with --n-samples > 1 the budget / adaptive planner needs --signal agreement|dispersion")
     if args.mask_mode != "rtc" and args.guidance == "none":
         raise SystemExit("--mask-mode needs guidance")
 
@@ -311,7 +313,8 @@ def main() -> None:
         actions = env_post({ACTION: postprocessor(model.clone())})[ACTION]
         disp_np, z_np = disp.cpu().numpy(), z.numpy()
         return Chunk(model, torch.as_tensor(actions).float().cpu().numpy(),
-                     signal=z_np if args.signal == "agreement" else None, dispersion=disp_np,
+                     signal=z_np if args.signal == "agreement" else (disp_np if args.signal == "dispersion" else None),
+                     dispersion=disp_np,
                      extras={"dispersion": disp_np, "agree": z_np, "sel": sel.numpy()})
 
     infer_time = {"s": 0.0, "n": 0}  # wall time per inference (policy calls + pre/post-processing), per suite
