@@ -62,10 +62,12 @@ def test_cli_checks():
 
 def make_planner(**kw):
     """Server with only what plan_step needs (no model)."""
+    from hstar import HStarRule
+
     args = ps.parse_args(["--mode", "rtc", "--n-samples", "4", "--adaptive", *kw.pop("argv", [])])
     srv = ps.Server.__new__(ps.Server)
     srv.args, srv.horizon = args, 50
-    srv.rule = ps.step_rule(args)
+    srv.rule = HStarRule("above", eta=args.eta, k=1, min_h=1)
     return srv
 
 
@@ -108,56 +110,64 @@ def test_plan_step_aac():
     assert srv.plan_step(np.zeros(50), 4, np.full(50, 0.25))[1] == 4  # flat (exact in binary): h* = 1, s = s_min
 
 
-def test_plan_step_from_dispersion():
-    srv = make_planner(argv=["--rule", "disp", "--eta", "0.5", "--s-max", "20"])
-    disp = np.r_[np.zeros(20), np.ones(30)]
-    assert srv.plan_step(None, 4, disp) == (19, 15)  # first chunk too; k = 3: the mean over 19..21 is 2/3
-    assert srv.plan_step(None, 4, np.zeros(50)) == (50, 20)  # never reaches eta: s_max
-    assert srv.plan_step(None, 4, np.ones(50)) == (1, 4)  # already above: s_min = d
+# ---------------------------------------------------------------- AAC, no guidance
 
-
-# ---------------------------------------------------------------- no guidance
-
-def make_unguided_server(monkeypatch):
+def make_aac_server(monkeypatch, argv):
     import shared_prefix
 
-    args = ps.parse_args(["--mode", "rtc", "--n-samples", "4", "--no-guidance", "--adaptive", "--rule", "disp",
-                          "--eta", "0.1", "--s-max", "20", "--device", "cpu"])
+    args = ps.parse_args(["--n-samples", "20", "--adaptive", "--rule", "aac_paper", "--s-max", "50", "--device", "cpu", *argv])
     srv = ps.Server.__new__(ps.Server)
     srv.args, srv.horizon, srv.a_max, srv.apc, srv.exec_h = args, 50, 32, 10, 10
-    srv.policy, srv.rtc, srv.log, srv.rule = None, FakeRTC(), None, ps.step_rule(args)
+    srv.policy, srv.rtc, srv.log, srv.post = None, FakeRTC(), None, lambda x: x
     calls = []
+    pattern = torch.randn(20, 7, generator=torch.Generator().manual_seed(0))
 
     def fake_predict(policy, batch, repeats, noise, **kw):
         calls.append(dict(kw, repeats=repeats, weights=srv.rtc.weight_override))
         out = torch.zeros(repeats, 50, 32)
-        out[:, 30:] = noise[:, 30:]  # the samples agree up to index 30
+        out[:, 30:, :7] = pattern[:, None]  # the samples agree up to index 30, then spread by a constant amount
+        out[:, :, 0] += 1.0  # the same motion in every sample: the motion floor is 4
         return out
 
     monkeypatch.setattr(shared_prefix, "predict_chunk_shared", fake_predict)
-    return srv, calls
+    return srv, calls, pattern
 
 
-def test_no_guidance_executes_sample_0_without_rtc_and_sets_the_step(monkeypatch):
-    srv, calls = make_unguided_server(monkeypatch)
-    torch.manual_seed(0)
-    noise = torch.randn(1, 50, 32)
+def test_aac_with_delay_executes_sample_0_without_rtc(monkeypatch):
+    srv, calls, pattern = make_aac_server(monkeypatch, ["--mode", "rtc", "--no-guidance"])
+    noise = torch.randn(1, 50, 32, generator=torch.Generator().manual_seed(1))
     state = {}
     chunk, plan = srv.infer_samples({}, noise, None, 0, 0, torch.tensor([10]), state)
-    assert plan == {"sel": 0, "h_star": 28, "s": 20, "len": 20} and torch.equal(state["full"], chunk[0])
+    assert plan == {"sel": 0, "h_star": 30, "s": 30, "len": 30} and torch.equal(state["full"], chunk[0])
     left, left_len = ps.leftover_tensor({"prev_chunk_left_over": np.zeros((10, 7), np.float32)}, 50)
     chunk, plan = srv.infer_samples({}, noise, left, left_len, 4, torch.tensor([10]), state)
-    # no guidance arguments, no guided rows; the executed row is the first noise; s = h* - d, the chunk returned is s + d
-    assert calls[-1] == {"repeats": 4, "weights": None}
-    assert plan == {"sel": 0, "h_star": 28, "s": 20, "len": 24}
-    torch.testing.assert_close(chunk[0, 30:], noise[0, 30:])
+    # no guidance arguments, no guided rows; s = h* - d, and the chunk returned is s + d long
+    assert calls[-1] == {"repeats": 20, "weights": None}
+    assert plan == {"sel": 0, "h_star": 30, "s": 26, "len": 30}
+    torch.testing.assert_close(chunk[0, 30:, 1:7], pattern[0, 1:][None].expand(20, 6))
 
 
-def test_no_guidance_cli_checks():
+def test_aac_sync_on_a_plain_server_and_constant_control(monkeypatch):
+    srv, calls, _ = make_aac_server(monkeypatch, [])
+    assert srv.args.mode == "plain"
+    noise = torch.randn(1, 50, 32, generator=torch.Generator().manual_seed(1))
+    _, plan = srv.infer_samples({}, noise, None, 0, 0, torch.tensor([10]), {})
+    assert plan == {"sel": 0, "h_star": 30, "s": 30, "len": 30} and calls[-1] == {"repeats": 20, "weights": None}
+    srv.args.s_min = srv.args.s_max = 7
+    _, plan = srv.infer_samples({}, noise, None, 0, 0, torch.tensor([10]), {})
+    assert plan["s"] == 7 and plan["len"] == 7
+
+
+def test_aac_and_no_guidance_cli_checks():
     ok = ["--mode", "rtc", "--n-samples", "4", "--no-guidance"]
     ps.parse_args(ok)
+    ps.parse_args(ok + ["--adaptive", "--rule", "aac_paper"])
+    ps.parse_args(["--n-samples", "20", "--adaptive", "--rule", "aac_paper"])
+    aac = ["--n-samples", "20", "--adaptive", "--rule", "aac_paper"]
     for bad in (["--n-samples", "4", "--no-guidance", "--mode", "plain"], ["--mode", "rtc", "--no-guidance"],
-                ok + ["--select", "coherent"], ok + ["--mask-mode", "conf"]):
+                ok + ["--select", "coherent"], ok + ["--mask-mode", "conf"],
+                aac + ["--mode", "rtc"],  # guided
+                ["--n-samples", "20", "--rule", "aac_paper"], aac[:2] + ["--mode", "plain"]):
         with pytest.raises(SystemExit):
             ps.parse_args(bad)
 

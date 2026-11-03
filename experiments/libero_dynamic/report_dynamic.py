@@ -64,7 +64,7 @@ def plan_stats(run: Path) -> str:
         deltas = [r["delta"] for r in trans if r.get("delta") is not None]
         dev = f", Δ mean {statistics.mean(deltas):.4g}, med {statistics.median(deltas):.4g}" if deltas else ""
         return f"L {statistics.mean(r['L'] for r in trans):.2f}{dev}"
-    rows = [r for r in rows if r.get("z") is not None]
+    rows = [r for r in rows if r.get("z") is not None or "s" in r]  # a plain server has no old plan, so no z
     if not rows:
         return "—"
     s = [r["s"] for r in rows if "s" in r]

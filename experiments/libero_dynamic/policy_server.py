@@ -122,13 +122,6 @@ def leftover_tensor(obs: dict, horizon: int) -> tuple[torch.Tensor | None, int]:
     return out, len(left)
 
 
-def step_rule(args):
-    """h* rule of --adaptive: --rule disp smooths as in the dispersion runs of libero_pro and robotwin (k = 3)."""
-    from hstar import HStarRule
-
-    return HStarRule("above", eta=args.eta, k=3 if args.rule == "disp" else 1, min_h=1)
-
-
 def aac_h_star(disp: np.ndarray, min_h: int = 1) -> int:
     """AAC [13] Eq. 5 on a per-action dispersion profile: h* = max(argmax_h (D_{h+1} - D_h), min_h)."""
     horizon = len(disp)
@@ -158,7 +151,9 @@ class Server:
             policy_cfg=self.policy.config, pretrained_path=args.policy,
             preprocessor_overrides={"device_processor": {"device": args.device}},
             postprocessor_overrides={"device_processor": {"device": "cpu"}})
-        self.rule = step_rule(args)
+        from hstar import HStarRule
+
+        self.rule = HStarRule("above", eta=args.eta, k=1, min_h=1)
         self.log = open(args.log_jsonl, "a") if args.log_jsonl else None
         self.budget = None
         if args.budget_head:
@@ -387,7 +382,13 @@ class Server:
         plan: dict[str, Any] = {"sel": sel}
         length = self.apc
         if a.adaptive:
-            h, s = self.plan_step(z, delay, disp)
+            given = None
+            if a.rule == "aac_paper":  # only with the unguided branch above: row 0 of `samples` is the executed one
+                from aac import paper_h_star
+
+                rows = torch.stack([self.post(samples[0, :, i, :]) for i in range(self.horizon)], dim=1)
+                given = paper_h_star(real[0].cpu().numpy(), rows.detach().cpu().numpy(), a.aac_move_th)
+            h, s = self.plan_step(z, delay, disp, given)
             length = s + delay
             plan.update(h_star=h, s=s)
         plan["len"] = length
@@ -400,28 +401,27 @@ class Server:
             self.log.flush()
         return chosen, plan
 
-    def plan_step(self, z: np.ndarray | None, delay: int, disp: np.ndarray | None = None) -> tuple[int, int]:
+    def plan_step(self, z: np.ndarray | None, delay: int, disp: np.ndarray | None = None,
+                  given: int | None = None) -> tuple[int, int]:
         """Reliable horizon h* and replanning step s = clip(h* - d, s_min, s_max).
 
         --rule agree: h* = first index where the old plan leaves the cloud of new samples (z > eta), H if never;
             the first chunk of an episode (no old plan) gets s_min.
         --rule aac:   h* = argmax_h (D_{h+1} - D_h), D_h = mean dispersion of the new samples over the first h
             actions (AAC [13], Eq. 5, with the dispersion in place of the action entropy), at least --aac-min-h.
-        --rule disp:  h* = first index where the smoothed dispersion of the new samples reaches eta, H if never.
+        --rule aac_paper: h* as in the authors' code, ``given`` (libero_pro/aac.py: action entropy and motion floor).
 
         With the runner's --prefetch-threshold d, a chunk of length s + d is executed for s steps before the next
         request (its last d actions cover the next inference), so s is the replanning step."""
         a = self.args
         s_min = a.s_min if a.s_min is not None else max(delay, 1)
         s_max = max(min(a.s_max, self.horizon - delay), s_min)
-        if a.rule == "aac":
+        if given is not None:
+            h = given
+        elif a.rule == "aac":
             if disp is None:
                 return self.horizon, s_min
             h = aac_h_star(np.asarray(disp, dtype=np.float64), a.aac_min_h)
-        elif a.rule == "disp":
-            if disp is None:
-                return self.horizon, s_min
-            h = int(self.rule(disp, 0))
         else:
             if z is None:
                 return self.horizon, s_min
@@ -482,10 +482,11 @@ def parse_args(argv=None):
     p.add_argument("--adaptive", action="store_true",
                    help="replanning step from plan agreement; run the runner with --prefetch-threshold d")
     p.add_argument("--no-guidance", action="store_true", help="K samples without RTC guidance (see the module docstring)")
-    p.add_argument("--rule", choices=["agree", "aac", "disp"], default="agree",
-                   help="adaptive: h* from plan agreement (z > eta), the growth of the samples' dispersion (AAC) "
-                        "or the samples' dispersion reaching eta")
-    p.add_argument("--eta", type=float, default=3.0, help="adaptive, agree / disp: threshold")
+    p.add_argument("--rule", choices=["agree", "aac", "aac_paper"], default="agree",
+                   help="adaptive: h* from plan agreement (z > eta), the growth of the samples' dispersion (AAC Eq. 5 only) "
+                        "or AAC as in the authors' code (libero_pro/aac.py; --mode plain or --no-guidance)")
+    p.add_argument("--eta", type=float, default=3.0, help="adaptive, agree: z threshold")
+    p.add_argument("--aac-move-th", type=float, default=3.0, help="adaptive, aac_paper: alpha of the motion floor")
     p.add_argument("--aac-min-h", type=int, default=1, help="adaptive, aac: lower bound of h*")
     p.add_argument("--s-min", type=int, default=None, help="adaptive: lower bound of s (default d)")
     p.add_argument("--s-max", type=int, default=20, help="adaptive: upper bound of s")
@@ -520,8 +521,11 @@ def parse_args(argv=None):
         p.error("--return-latent needs one sample and the plain RTC mask")
     if args.adaptive and args.n_samples < 2:
         p.error("--adaptive needs --n-samples > 1 and --mode rtc")
-    if args.n_samples > 1 and args.mode != "rtc":
+    if args.n_samples > 1 and args.mode != "rtc" and args.rule != "aac_paper":
         p.error("--n-samples > 1 needs --mode rtc (selection and the mask use the old plan)")
+    if args.rule == "aac_paper" and (not args.adaptive or args.select != "first" or args.mask_mode != "rtc"
+                                     or (args.mode == "rtc" and not args.no_guidance)):
+        p.error("--rule aac_paper needs --adaptive and no RTC (--mode plain or --no-guidance), without selection or masks")
     if args.mask_mode == "transition" and (args.mode != "rtc" or args.n_samples != 1 or args.adaptive):
         p.error("--mask-mode transition needs --mode rtc and one sample")
     if args.no_guidance and (args.mode != "rtc" or args.n_samples < 2 or args.select != "first" or args.mask_mode != "rtc"

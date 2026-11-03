@@ -49,7 +49,8 @@ class Chunk:
     actions: np.ndarray  # (B, H, A) environment actions
     entropy: np.ndarray | None = None  # (B, H) cross-attention entropy (last denoising step)
     n_valid: np.ndarray | None = None  # (B,) number of valid prefix tokens (entropy normaliser)
-    # (B, H) per-action signal the planner reads instead of the entropy (e.g. dispersion across noise samples)
+    # (B, H) per-action signal the planner reads instead of the entropy (e.g. dispersion across noise samples),
+    # or (B,) h* itself for planner.GivenHStar
     signal: np.ndarray | None = None
     # name -> (B, ...) arrays stored in the chunk log when keep_entropy (e.g. "dispersion", "plan")
     extras: dict = field(default_factory=dict)

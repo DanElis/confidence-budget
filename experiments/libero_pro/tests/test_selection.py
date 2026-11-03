@@ -171,10 +171,7 @@ def test_sample_cli_checks():
     check_sample_args(parse_args(ok))
     check_sample_args(parse_args(ok + ["--planner", "adaptive", "--signal", "agreement",
                                        "--hstar-rule", "kind=above,eta=2,k=1,min_h=1"]))
-    check_sample_args(parse_args(["--out", "x", "--n-samples", "4", "--planner", "adaptive", "--signal", "dispersion",
-                                  "--hstar-rule", "kind=above,eta=2,k=3,min_h=1", "--guidance", "none"]))
     for bad in (["--out", "x", "--select", "coherent"],  # K = 1
-                ["--out", "x", "--signal", "dispersion"],  # K = 1
                 ok + ["--planner", "adaptive", "--hstar-rule", "kind=above,eta=2"],  # entropy signal with K > 1
                 ["--out", "x", "--n-samples", "4", "--mask-mode", "rtc_x_conf"],  # mask without guidance
                 ok + ["--record-entropy"]):

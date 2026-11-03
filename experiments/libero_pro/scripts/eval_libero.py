@@ -18,8 +18,8 @@ chosen noise is then generated once more with RTC.
     --mask-mode rtc_x_conf|conf --conf-sigma S --conf-ref R   RTC mask weighted by exp(-D_old / (S * R))
     --signal agreement --planner adaptive|budget --hstar-rule kind=above,eta=Z,k=1,min_h=1
                                                    h* = first index where the old plan leaves the new samples' cloud
-    --signal dispersion --planner adaptive --hstar-config F (calibrate_step.py)
-                                                   h* = first index where the samples' dispersion reaches eta
+    --signal aac --planner adaptive --guidance none --n-samples 20
+                                                   AAC as in the authors' code (aac.py), s = max(h* - d, d)
 
 Suites: stock LIBERO names (``libero_object``) and LIBERO-PRO position levels
 (``pos:x0.2``, ``pos:y0.1``, ``pos:all``). Results go to ``--out`` as one JSON
@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / "h1"))
 
+from aac import paper_h_star  # noqa: E402
 from closed_loop import Chunk, LoopConfig, run_batch, sparc, stack_observations, switch_jumps  # noqa: E402
 from hstar import HStarRule  # noqa: E402
 from libero_pro_suites import (  # noqa: E402
@@ -55,7 +56,7 @@ from libero_pro_suites import (  # noqa: E402
     register_position_suites,
     suite_name,
 )
-from planner import AdaptivePlanner, BudgetPlanner, EntropyLambda, FixedPlanner  # noqa: E402
+from planner import AdaptivePlanner, BudgetPlanner, EntropyLambda, FixedPlanner, GivenHStar  # noqa: E402
 from shared_prefix import predict_chunk_shared  # noqa: E402
 from selection import (  # noqa: E402
     MASK_MODES,
@@ -113,8 +114,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--shared-prefix", action="store_true",
                    help="K > 1: encode each observation's prefix once and repeat its KV cache over the samples "
                         "(shared_prefix.py) instead of repeating the observation")
-    p.add_argument("--signal", choices=["entropy", "agreement", "dispersion"], default="entropy",
-                   help="what the budget / adaptive planner's h* rule reads (agreement, dispersion need --n-samples > 1)")
+    p.add_argument("--signal", choices=["entropy", "agreement", "aac"], default="entropy",
+                   help="what the budget / adaptive planner's h* rule reads (agreement, aac need --n-samples > 1); "
+                        "aac: h* of aac.py, no rule to give")
     # outputs
     p.add_argument("--record-entropy", action="store_true", help="store cross-attention entropy of every chunk")
     p.add_argument("--save-actions", action="store_true", help="store executed actions (.npy)")
@@ -154,6 +156,8 @@ def parse_rule(text: str) -> HStarRule:
 def make_planner(args, horizon: int):
     if args.planner == "fixed":
         return FixedPlanner(horizon, args.stride, args.mask_end)
+    if args.signal == "aac":
+        return AdaptivePlanner(horizon, GivenHStar(), s_min=1)
     if args.hstar_rule:
         rule = parse_rule(args.hstar_rule)
     elif args.hstar_config:
@@ -178,11 +182,13 @@ def check_sample_args(args) -> None:
     if k < 1:
         raise SystemExit("--n-samples must be >= 1")
     if k == 1 and (args.select != "first" or args.mask_mode != "rtc" or args.signal != "entropy"):
-        raise SystemExit("--select, --mask-mode and --signal agreement|dispersion need --n-samples > 1")
+        raise SystemExit("--select, --mask-mode and --signal agreement|aac need --n-samples > 1")
+    if args.signal == "aac" and (args.planner != "adaptive" or args.guidance != "none" or args.select != "first"):
+        raise SystemExit("--signal aac needs --planner adaptive, --guidance none and the first sample")
     if k > 1 and args.record_entropy:
         raise SystemExit("--record-entropy is not supported with --n-samples > 1")
     if k > 1 and args.planner != "fixed" and args.signal == "entropy":
-        raise SystemExit("with --n-samples > 1 the budget / adaptive planner needs --signal agreement|dispersion")
+        raise SystemExit("with --n-samples > 1 the budget / adaptive planner needs --signal agreement|aac")
     if args.mask_mode != "rtc" and args.guidance == "none":
         raise SystemExit("--mask-mode needs guidance")
 
@@ -312,9 +318,13 @@ def main() -> None:
         model = model.float()
         actions = env_post({ACTION: postprocessor(model.clone())})[ACTION]
         disp_np, z_np = disp.cpu().numpy(), z.numpy()
-        return Chunk(model, torch.as_tensor(actions).float().cpu().numpy(),
-                     signal=z_np if args.signal == "agreement" else (disp_np if args.signal == "dispersion" else None),
-                     dispersion=disp_np,
+        signal = z_np if args.signal == "agreement" else None
+        if args.signal == "aac":
+            rows = env_post({ACTION: postprocessor(samples.reshape(n * k, horizon, -1).clone())})[ACTION]
+            rows = torch.as_tensor(rows).float().cpu().numpy().reshape(n, k, horizon, -1)
+            normalized = real.cpu().numpy()
+            signal = np.array([paper_h_star(normalized[i], rows[i]) for i in range(n)])
+        return Chunk(model, torch.as_tensor(actions).float().cpu().numpy(), signal=signal, dispersion=disp_np,
                      extras={"dispersion": disp_np, "agree": z_np, "sel": sel.numpy()})
 
     infer_time = {"s": 0.0, "n": 0}  # wall time per inference (policy calls + pre/post-processing), per suite

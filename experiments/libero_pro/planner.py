@@ -98,6 +98,14 @@ class BudgetPlanner:
 
 
 @dataclass(frozen=True)
+class GivenHStar:
+    """h* computed by the infer function (aac.py needs all samples); the chunk's signal is then h* itself."""
+
+    def __call__(self, signal: np.ndarray, n_valid: int | None) -> int:
+        return int(signal)
+
+
+@dataclass(frozen=True)
 class AdaptivePlanner:
     """Adaptive chunking (as in AAC): execute the chunk up to its reliable horizon, then replan.
 
@@ -108,7 +116,7 @@ class AdaptivePlanner:
     """
 
     horizon: int
-    rule: HStarRule
+    rule: HStarRule | GivenHStar
     s_min: int = 5
     s_max: int | None = None
     mask_r: int | None = None
