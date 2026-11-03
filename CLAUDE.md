@@ -17,6 +17,7 @@
 - Запуски, тесты и установку делает пользователь на сервере; локально только код и git (skill `remote-server`).
 - `experiments/libero_dynamic/night_budget.sh` — joint before-generation PPO для текущих s,r с полным H=50; заморожены π0.5 и ResNet-18. `learned_budget_queue.py` хранит полный план и явно планирует запрос t+s; `budget_runtime.py` выбирает r до генерации с execution_horizon=d+r. Train/val/test разделены по траекториям, сравнения с постоянными парами и marginal-random; инструкция `BUDGET.md`. Пока только статическая проверка, запуск/тесты на сервере.
 - Пилот `budget_joint_d4_v2` завершён на сервере: 38 CPU-тестов прошли, selected step=2, learned 2/16 против random 4/16 при одинаковой частоте; улучшение не показано. `diagnose_budget.py` — CPU-аудит сохранённых split/решений/вероятностей MLP; фактический состав split ещё проверить. Подробности `docs/STATUS.md` и `BUDGET.md`.
+- `experiments/libero_dynamic/night_budget_v2.sh` — следующий шаг после пилота: option budget без PPO (`budget_v2.py`, `fit_budget.py`, `budget_options.py`), явные списки сцен, офлайн-условия останавливают запуск до validation/test. Пока не запускался; инструкция в начале `BUDGET.md`.
 - Ветка `h1-offline-check`, PR #1 в `github.com/DanElis/confidence-budget`.
 
 ## Сервер

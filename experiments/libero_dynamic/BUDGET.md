@@ -1,5 +1,75 @@
 # Joint before-generation budget on LIBERO-Dynamic
 
+## Option budget (v2): `night_budget_v2.sh`
+
+Code only; nothing below has been run yet. The PPO pipeline further down is kept for the record.
+
+Why the pilot could not learn. One request changes success far less than a binary outcome's noise, and ~70
+independent per-request decisions share one Monte Carlo return, so 16 episodes per iteration carry almost no
+per-decision signal. White-noise exploration also undoes itself at the next request. 2469 inputs, dominated by the old
+tail, sit over ~1100 samples per batch; pooled ImageNet features barely react to a small moving object. Checkpoint
+selection and test on 16 episodes (SE ~12 pp) cannot resolve effects below ~25 pp.
+
+| problem | v2 |
+|---|---|
+| credit | an option holds (s,r) for 40 ticks (~15 per episode, equal duration); lambda-return from a cross-fitted V, so the change of V, a potential, carries short-term signal and telescopes to the terminal objective |
+| target | V(actor input, object poses, task, level) predicts final success. It uses simulator state and is never deployed |
+| exploration | uniform pair per option with logged propensity, then epsilon-greedy around the first policy, pooled |
+| learner | one-step policy improvement: Q regression on all logged data, CPU only. No on-policy data loss |
+| features | 59 inputs: robot, old plan geometry and first gripper transition, per-tick frame differences on a grid, old plan residual under the fresh prefix, context. Prefix latent is logged; PCA is a secondary variant |
+| rate | one multiplier hits a target request rate; the fixed control may use any integer s, so "equal rate" holds by design |
+| split | explicit item lists: the same scenes in all splits, trajectories 0,1 / 2 / 3,4 of 40 tasks x 3 levels |
+| evidence | 240 paired test episodes (expected CI about +-7 pp from earlier 600-pair runs) instead of 16 |
+
+Still one generation per request. The decision runs after the prefix pass and before denoising, and sets the mask of
+this generation (r) and the next request (s). The residual costs one expert pass (~1/10 of a call in the earlier
+benchmark). Default d=7 follows the measured ~0.33 s at 20 Hz; the smoke run reports `ticks_required`.
+
+Decisions fixed before the run, in `fit_1/fit.md`:
+1. V out-of-fold AUROC for final success at steps 150..450 is at least 0.65. Otherwise V carries no usable signal.
+2. Doubly robust held-out value of greedy Q against the SAME action frequencies assigned independently of the state:
+   CI lower bound above zero. This is the value of state dependence itself at equal rate.
+If either fails, the run stops before validation and test (`stopped.txt`). `--force` overrides this for inspection.
+Primary test: learned against the constant pair (s=12, r selected on validation) at equal rate, CI above zero.
+Secondary: learned against marginal-random (same frequencies, held 40 ticks); the gripper-phase rule (open: 7,0;
+closed: 20,12; deployable signal, no learning) against the constant pair at its own rate. Feature blocks in `fit.md`
+are multiple comparisons. Goals may move too (conveyor targets can include the receptacle), so the rule is a
+hypothesis to test, not a known oracle.
+
+Limits. Greedy on Q is one step of improvement on the data's state distribution; the second round only partly corrects
+the shift. The gate estimate sums one-step effects and predicts no episode-level gain. V is cross-fitted with Q on
+the same folds, so a small dependence between fold models remains. Object choice by instruction words is a heuristic;
+the smoke run reports the fallback share. One exploration seed: no training-seed variance.
+
+Item -> worker slot -> env seed is fixed by the list and `--workers` (`_split_round_robin`), so parallel workers keep
+pairing, unlike the assumption in `learn_budget.py`. Finished rollouts are skipped on restart with the same OUT.
+
+```bash
+cd ~/work/cv/confidence-budget && git pull && git log -1 --oneline
+```
+
+```bash
+nvidia-smi
+```
+
+```bash
+cd ~/work/cv/confidence-budget/experiments/libero_dynamic && OUT=runs/budget_v2_d7 bash night_budget_v2.sh --smoke-only
+```
+
+Inspect `runs/budget_v2_d7/experiment/smoke_done.json`, then in tmux (same OUT reuses the smoke):
+
+```bash
+cd ~/work/cv/confidence-budget/experiments/libero_dynamic && OUT=runs/budget_v2_d7 bash night_budget_v2.sh
+```
+
+Sizes with defaults: 720 exploration episodes before the gates; then 600 validation + 240 refinement + 120 for a
+second policy, up to 240 more if a rate recalibration is needed; 1200 test. Requires ~52 GB free GPU memory (4 servers).
+`--scene-limit N` subsamples scenes without looking at outcomes.
+
+Output in `experiment/`: `fit_1/fit.md`, `fit_2/fit.md`, `selection.json`, `report.md`, `stopped.txt`.
+
+## PPO pilot (v1)
+
 `night_budget.sh` trains only a small MLP actor/critic with on-policy PPO. Pi0.5
 (`lerobot/pi05_libero_finetuned`) and the ImageNet ResNet-18 encoder are frozen.
 No demonstration-action targets and no correction head are used.

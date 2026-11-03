@@ -167,7 +167,7 @@ def policy_report(root, runs, selection, max_samples):
              "This separates feature dependence from forced masking and sampling noise.", "",
              "| run | samples | group-centered probability RMS | mean TV to group mean | mean entropy, nats |",
              "|---|---:|---:|---:|---:|"]
-    sensitivity = []
+    sensitivity, argmax_lines = [], []
     for name in (f"val_{selection['iteration']}", "test_learned"):
         if name not in runs:
             raise ValueError(f"missing selected rollout {name}")
@@ -208,6 +208,10 @@ def policy_report(root, runs, selection, max_samples):
         error = float((observed - torch.tensor(logps)).abs().max())
         if error > 2e-5:
             raise ValueError(f"{name}: best.pt disagrees with saved behavior probabilities (max logp error {error})")
+        greedy = Counter(tuple(pairs[i]) for i in p.argmax(1).tolist())
+        (modal, count), = greedy.most_common(1)
+        argmax_lines.append(f"| {name} | {modal} | {100*count/len(xs):.2f} | "
+                            + ", ".join(f"{k}: {v}" for k, v in sorted(greedy.items())) + " |")
         ids = [ids for ids in groups.values() if len(ids) >= 2]
         if not ids:
             lines.append(f"{name}: no repeated task/mask groups; cannot estimate feature dependence.")
@@ -233,7 +237,11 @@ def policy_report(root, runs, selection, max_samples):
             tv = (q - p).abs().sum(1)[used_ids].mean() / 2
             flips = (q.argmax(1) != p.argmax(1))[used_ids].float().mean()
             sensitivity.append(f"| {name} | {block} | {tv:.6f} | {100*flips:.2f} |")
-    lines.extend(["", "| run | shuffled input block | mean probability TV | argmax changes % |",
+    lines.extend(["", "| run | modal greedy pair | share of decisions, % | greedy decisions on saved states |",
+                  "|---|---|---:|---|", *argmax_lines, "",
+                  "If the share is near 100%, greedy execution is the constant modal pair on these states, and a greedy "
+                  "rollout would only repeat that fixed control.",
+                  "", "| run | shuffled input block | mean probability TV | argmax changes % |",
                   "|---|---|---:|---:|", *sensitivity, "",
                   "Block shuffling measures input sensitivity, not success or causal benefit. Shuffled inputs "
                   "may be physically inconsistent. Near-zero variation indicates nearly constant probabilities "

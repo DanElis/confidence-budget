@@ -10,6 +10,7 @@
 # Environment: SPEEDS ("0.03 0.06 0.09"), LEVELS ("l1 l2 l3"), TRAJ ("0 1 2 3 4"), LIMIT (items per speed, empty =
 # all 40 tasks x levels x trajectories), SERVERS (policy server processes, 4), WORKERS (simulator workers, 8),
 # PORT (8124), RUNS (runs). Full configuration: 3 speeds x 600 = 1800 episodes. Finished speeds are skipped.
+# ITEM_IDS_FILE: JSON list of exact item ids (budget_items.py), replaces LIMIT; order and worker slots are preserved.
 #
 # RUNNER_ARGS: extra arguments for the benchmark runner (e.g. "--prefetch-threshold 4" for the adaptive step).
 # KEEP_CHUNK=1: the client keeps the whole returned chunk instead of trimming it to K (patch_runner.sh).
@@ -135,6 +136,7 @@ print(f"speed {speed}: patched {n} alpha_mps entries")
 PY
   extra=()
   [[ -n $LIMIT ]] && extra=(--start-index "$START_INDEX" --limit "$LIMIT")
+  [[ -n ${ITEM_IDS_FILE:-} ]] && extra=(--item-ids-file "$(realpath "$ITEM_IDS_FILE")")
   echo "$(date '+%F %T') start $NAME v=$v"
   (cd "$DYN" && "$DPY" "scripts/run_pi05_${STRATEGY}_eval.py" --config-dir "$cfg" --output-dir "$OUT/v$v" \
      --levels $LEVELS --traj-indices $TRAJ --num-workers "$WORKERS" --policy openpi_ws --openpi-host 127.0.0.1 \

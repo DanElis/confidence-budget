@@ -5,10 +5,16 @@ latency is supported; actual encoder+actor+pi0.5 wall time remains in diagnostic
 """
 from __future__ import annotations
 
+import sys
 import uuid
+from pathlib import Path
+
 import numpy as np
 
 from ..control import ChunkQueueControllerBase
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # the real directory: this file is symlinked upstream
+from budget_privileged import ObjectTracker  # noqa: E402
 
 
 class BudgetPolicy:
@@ -21,7 +27,8 @@ class BudgetPolicy:
 
     def get_action_chunk_rtc(self, obs, language, *, prev_chunk_left_over, inference_delay_steps):
         request = self.inner._observation(obs, language)
-        request.update(budget_id=obs["budget_id"], budget_step=obs["budget_step"])
+        request.update(budget_id=obs["budget_id"], budget_step=obs["budget_step"],
+                       budget_episode=obs["budget_episode"], budget_priv=obs["budget_priv"])
         request["prev_chunk_left_over"] = np.asarray(prev_chunk_left_over, np.float32).reshape(-1, self.inner.action_dim)
         request["inference_delay_steps"] = int(inference_delay_steps)
         result = self.inner.client.infer(request)
@@ -42,12 +49,14 @@ class LearnedBudgetQueueController(ChunkQueueControllerBase):
         self.next_request = 0
         self.current_tick = 0
         self.budget_trace = []
+        self.tracker = ObjectTracker()
 
     def reset(self):
         super().reset()
         self.policy.extras.clear()
         self.next_request = self.current_tick = 0
         self.budget_trace = []
+        self.tracker.reset()
 
     def uses_rtc_conditioning(self):
         return True
@@ -57,7 +66,9 @@ class LearnedBudgetQueueController(ChunkQueueControllerBase):
 
     def snapshot_request_observation(self, packet, actions):
         obs = super().snapshot_request_observation(packet, actions)
-        obs.update(budget_id=uuid.uuid4().hex, budget_step=int(packet.step_idx))
+        # budget_priv goes to the trace of the value target only; the deployed actor never reads it.
+        obs.update(budget_id=uuid.uuid4().hex, budget_step=int(packet.step_idx), budget_episode=str(packet.episode_id),
+                   budget_priv=self.tracker(packet.obs, packet.language, packet.step_idx))
         return obs
 
     def _submit(self, packet, actions):

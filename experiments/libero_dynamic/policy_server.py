@@ -160,6 +160,12 @@ class Server:
             self.policy.eval().requires_grad_(False)
             self.budget = BudgetRuntime(args.budget_head, args.budget_traces, args.budget_mode,
                                         args.budget_fixed, args.budget_seed, args.device)
+        self.option_budget = None
+        if args.option_budget:
+            from budget_options import OptionRuntime
+
+            self.policy.eval().requires_grad_(False)
+            self.option_budget = OptionRuntime(args.option_budget, args.budget_traces)
 
     @property
     def metadata(self) -> dict:
@@ -173,7 +179,7 @@ class Server:
                 "trans_min": a.trans_min, "trans_max": a.trans_max, "trans_window": a.trans_window,
                 "fresh_t": a.fresh_t, "return_latent": a.return_latent,
                 "budget_head": a.budget_head, "budget_mode": a.budget_mode,
-                "budget_seed": a.budget_seed, "budget_fixed": a.budget_fixed}
+                "budget_seed": a.budget_seed, "budget_fixed": a.budget_fixed, "option_budget": a.option_budget}
 
     def batch(self, obs: dict) -> dict:
         return self.pre({"observation.images.image": as_image(obs["observation/image"]),
@@ -181,7 +187,44 @@ class Server:
                          "observation.state": torch.as_tensor(np.array(obs["observation/state"], dtype=np.float32)),
                          "task": str(obs.get("prompt", ""))})
 
+    def infer_option(self, obs: dict, state: dict) -> dict:
+        """One RTC chunk whose (s, r) is chosen after the prefix pass and before denoising (budget_options.py)."""
+        from shared_prefix import predict_chunk_shared
+
+        a, dev = self.args, self.args.device
+        batch = self.batch(obs)
+        noise = request_noise(obs, a.seed, self.horizon, self.a_max)
+        left, _ = leftover_tensor(obs, self.horizon)
+        delay = int(obs.get("inference_delay_steps", 0) or 0)
+        raw_left = np.asarray(obs.get("prev_chunk_left_over", []), np.float32).reshape(-1, ACTION_DIM)
+        mask_end = torch.tensor([delay])  # read by the RTC processor after decide() has set it in place
+        info: dict[str, Any] = {}
+        decision: dict[str, Any] = {}
+
+        def decide(velocity):
+            residual = None
+            if left is not None:
+                residual = plan_residual(velocity, left[..., :ACTION_DIM].to(dev), noise.to(dev), a.fresh_t)[0].cpu().numpy()
+            decision.update(self.option_budget.choose(obs, state, raw_left, delay, self.horizon, residual,
+                                                      info["latent"][0].cpu().numpy()))
+            mask_end[0] = delay + decision["r"]
+
+        kw = {} if left is None else dict(inference_delay=delay, prev_chunk_left_over=left.to(dev), execution_horizon=mask_end)
+        with torch.no_grad():
+            chunk = predict_chunk_shared(self.policy, batch, 1, noise=noise.to(dev), before_integrate=decide,
+                                         latent_out=info, **kw).float()
+        if not decision:
+            raise RuntimeError("the budget decision did not run before denoising")
+        if str(dev).startswith("cuda"):
+            decision["gpu_peak_allocated_mb"] = torch.cuda.max_memory_allocated(dev) / 2**20
+        original = chunk[0].detach().cpu().numpy().astype(np.float32)
+        actions = torch.stack([self.post(chunk[:, i, :]) for i in range(chunk.shape[1])], dim=1)
+        return {"actions": actions[0].detach().cpu().numpy().astype(np.float32), "original_actions": original,
+                "plan": {"sel": 0, "s": decision["s"], "r": decision["r"], "len": self.horizon}, "budget": decision}
+
     def infer(self, obs: dict, state: dict) -> dict:
+        if getattr(self, "option_budget", None) is not None:
+            return self.infer_option(obs, state)
         a, dev = self.args, self.args.device
         batch = self.batch(obs)
         noise = request_noise(obs, a.seed, self.horizon, self.a_max)
@@ -449,11 +492,14 @@ def parse_args(argv=None):
     p.add_argument("--budget-mode", choices=["sample", "greedy", "fixed", "random"], default="sample")
     p.add_argument("--budget-fixed", default="8,4")
     p.add_argument("--budget-seed", type=int, default=0)
+    p.add_argument("--option-budget", default=None, help="JSON config of budget_options.OptionRuntime")
     args = p.parse_args(argv)
-    if args.budget_head and (args.mode != "rtc" or args.n_samples != 1 or args.mask_mode != "rtc"
-                             or args.adaptive or args.return_latent or not args.budget_traces
-                             or args.actions_per_chunk != 50):
-        p.error("--budget-head requires plain single-sample RTC, --actions-per-chunk 50 and --budget-traces")
+    if args.budget_head and args.option_budget:
+        p.error("--budget-head and --option-budget are alternatives")
+    if (args.budget_head or args.option_budget) and (args.mode != "rtc" or args.n_samples != 1 or args.mask_mode != "rtc"
+                                                     or args.adaptive or args.return_latent or not args.budget_traces
+                                                     or args.actions_per_chunk != 50):
+        p.error("--budget-head/--option-budget require plain single-sample RTC, --actions-per-chunk 50 and --budget-traces")
     if args.return_latent and (args.n_samples != 1 or args.mask_mode != "rtc"):
         p.error("--return-latent needs one sample and the plain RTC mask")
     if args.adaptive and args.n_samples < 2:

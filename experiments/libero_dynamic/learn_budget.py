@@ -193,8 +193,8 @@ class Experiment:
         traces.mkdir(parents=True)
         env = os.environ.copy()
         env.pop("CORR_HEAD", None)
-        # Upstream seeds env with seed+worker_slot. A single evaluation worker
-        # avoids completion-order-dependent item/worker assignments across methods.
+        # Upstream seeds env with seed+worker_slot; slots come from a static round-robin
+        # over the item list, so equal lists and worker counts would also stay paired.
         servers = a.servers if name.startswith("train_") else 1
         env.update(RUNS=str(self.runs), SPEEDS=str(a.speed), LEVELS=a.levels, TRAJ=split,
                    LIMIT=str(limit or (a.train_episodes if split == a.train_traj else a.eval_episodes)),
