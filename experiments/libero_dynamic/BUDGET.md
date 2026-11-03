@@ -97,3 +97,27 @@ needs additional free GPU memory; GPU wait's threshold should be adjusted.
 Validation/test always use one worker and the same explicit environment seed:
 upstream uses seed+worker_slot, so concurrent worker assignment could otherwise
 break paired comparisons when methods have different episode lengths.
+
+## Audit an existing completed experiment (CPU only)
+
+`diagnose_budget.py` reads manifests and saved feature traces. It reports actual
+task/level/trajectory composition, differences between splits, SR on shared
+scenes, joint (s,r) histograms across training and evaluation, and per-task test
+frequencies. Start requests are excluded from histograms because r=0 is forced.
+It also loads only the small selected `best.pt` MLP on CPU to measure variation
+of its probabilities within identical task/feasibility groups. Saved behavior
+log probabilities must agree with the selected checkpoint. Input-block shuffles
+measure sensitivity, not physical counterfactuals or success improvement.
+
+```bash
+cd ~/work/cv/confidence-budget/experiments/libero_pro && CUDA_VISIBLE_DEVICES="" uv run --with pytest python -m pytest -q ../libero_dynamic/tests/test_budget_diagnostics.py
+```
+
+```bash
+cd ~/work/cv/confidence-budget/experiments/libero_dynamic && CUDA_VISIBLE_DEVICES="" uv run --project ../libero_pro python diagnose_budget.py runs/budget_joint_d4_v2/experiment
+```
+
+Output is printed and saved in `experiment/diagnostics.md`. No rollouts, image
+encoder, base-policy loading, training or downloads are performed by the audit.
+For the split/histogram checks alone, standard-library Python is sufficient:
+`python3 diagnose_budget.py runs/budget_joint_d4_v2/experiment --hist-only`.
