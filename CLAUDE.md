@@ -19,6 +19,7 @@
 - Пилот `budget_joint_d4_v2` завершён на сервере: 38 CPU-тестов прошли, selected step=2, learned 2/16 против random 4/16 при одинаковой частоте; улучшение не показано. `diagnose_budget.py` — CPU-аудит сохранённых split/решений/вероятностей MLP; аудит подтвердил разный состав split и greedy = (8,4) в 100% решений, greedy-прогон не нужен. Подробности `docs/STATUS.md` и `BUDGET.md`.
 - `experiments/libero_dynamic/night_budget_v2.sh` — следующий шаг после пилота: option budget без PPO (`budget_v2.py`, `fit_budget.py`, `budget_options.py`), явные списки сцен, офлайн-условия останавливают запуск до validation/test. Пока не запускался; инструкция в начале `BUDGET.md`.
 - Чистый AAC без RTC: `libero_pro/aac.py` (по коду авторов), `libero_pro/scripts/stages/pure_aac.sh`, `libero_dynamic/run_pure_aac.sh` (`policy_server.py --adaptive --rule aac_paper`, плюс `--no-guidance` при задержке), контроль с той же частотой — `libero_pro/scripts/step_controls.py`. LIBERO-Dynamic завершён: прироста нет (`sync` −1.3 [−5.3; +2.8], d = 4 −0.3 [−4.3; +3.8]), LIBERO-Pro запущен 04.11.
+- π0.5 через openpi: `libero_pro/scripts/setup_openpi.sh`, `eval_openpi.py` (клиент сервера openpi, H = 10, рендер 256), `stages/openpi_base.sh` (`s=5` против статьи AAC; LeRobot у нас H = 50, рендер 360). Пока не запускался.
 - Ветка `h1-offline-check`, PR #1 в `github.com/DanElis/confidence-budget`.
 
 ## Сервер

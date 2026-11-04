@@ -85,6 +85,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--episodes-per-task", type=int, default=50, help="init states per task (LIBERO has 50)")
     p.add_argument("--batch-size", type=int, default=10, help="environments run in parallel")
     p.add_argument("--max-steps", type=int, default=None, help=f"default: {MAX_STEPS} for libero_object-based suites")
+    p.add_argument("--resolution", type=int, default=None, help="camera render size (default: LeRobot's 360)")
     p.add_argument("--delay", type=int, default=0, help="d, simulated latency in control steps")
     p.add_argument("--guidance", choices=["none", "lerobot", "exact"], default="none")
     p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"])
@@ -242,7 +243,8 @@ def main() -> None:
         policy_cfg=policy.config, pretrained_path=args.policy,
         preprocessor_overrides={"device_processor": {"device": args.device}},
     )
-    env_cfg = LiberoEnvConfig(task=suites[0], episode_length=max_steps)
+    size = {} if args.resolution is None else {"observation_height": args.resolution, "observation_width": args.resolution}
+    env_cfg = LiberoEnvConfig(task=suites[0], episode_length=max_steps, **size)
     env_pre, env_post = env_cfg.get_env_processors()
     camera_names = parse_camera_names(env_cfg.camera_name)
     noise_shape = (horizon, int(policy.config.max_action_dim))

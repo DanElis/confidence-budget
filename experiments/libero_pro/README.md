@@ -62,6 +62,17 @@ uv run python scripts/eval_libero.py --suites pos:x0.2 --stride 10 --delay 4 --g
 
 `--record-entropy` сохраняет энтропию cross-attention каждого чанка (для калибровки $h^*$), `--save-actions` — исполненные действия.
 
+## π0.5 через openpi
+
+Для сверки с опубликованными числами: чекпоинт `pi05_libero` (H = 10) обслуживает сервер openpi в отдельном окружении, а `scripts/eval_openpi.py` исполняет постоянный шаг в той же среде и пишет те же файлы результатов.
+
+```bash
+bash scripts/setup_openpi.sh
+tmux new -s openpi "bash scripts/stages/openpi_base.sh"
+```
+
+Тест клиента с протоколом: `uv run --with 'websockets>=15' --with msgpack python -m pytest -q tests/test_eval_openpi.py`.
+
 ## Этапы экспериментов
 
 ### Всё одним запуском (рекомендуется)
