@@ -16,7 +16,6 @@ echo "openpi: $(git -C "$OPENPI" rev-parse --short HEAD)"
 cd "$OPENPI"
 unset VIRTUAL_ENV
 GIT_LFS_SKIP_SMUDGE=1 uv sync
-command -v gsutil > /dev/null || echo "note: no gsutil, openpi falls back to gcsfs, which may fail on this bucket without GCP credentials"
 .venv/bin/python - <<'EOF'
 import jax
 from openpi.shared import download
@@ -24,6 +23,7 @@ from openpi.training import config
 
 print("devices:", jax.devices())
 print("action_horizon:", config.get_config("pi05_libero").model.action_horizon)
-print("checkpoint:", download.maybe_download("gs://openpi-assets/checkpoints/pi05_libero"))
+# The public bucket needs no account: without gsutil, the search for GCP credentials can hang with no output.
+print("checkpoint:", download.maybe_download("gs://openpi-assets/checkpoints/pi05_libero", token="anon"))
 EOF
 echo "setup done"
