@@ -16,6 +16,7 @@ echo "openpi: $(git -C "$OPENPI" rev-parse --short HEAD)"
 cd "$OPENPI"
 unset VIRTUAL_ENV
 GIT_LFS_SKIP_SMUDGE=1 uv sync
+.venv/bin/python "$HERE/scripts/download_openpi_assets.py"
 .venv/bin/python - <<'EOF'
 import jax
 from openpi.shared import download
@@ -23,7 +24,6 @@ from openpi.training import config
 
 print("devices:", jax.devices())
 print("action_horizon:", config.get_config("pi05_libero").model.action_horizon)
-# The public bucket needs no account: without gsutil, the search for GCP credentials can hang with no output.
-print("checkpoint:", download.maybe_download("gs://openpi-assets/checkpoints/pi05_libero", token="anon"))
+print("openpi sees:", download.maybe_download("gs://openpi-assets/checkpoints/pi05_libero"))  # from the cache, no network
 EOF
 echo "setup done"
