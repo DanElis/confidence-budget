@@ -71,7 +71,9 @@ bash scripts/setup_openpi.sh
 tmux new -s openpi "bash scripts/stages/openpi_base.sh"
 ```
 
-Тест клиента с протоколом: `uv run --with 'websockets>=15' --with msgpack python -m pytest -q tests/test_eval_openpi.py`.
+AAC на той же модели: `scripts/openpi_sample_server.py` отдаёт N сэмплов с заданным клиентом шумом, `scripts/stages/openpi_aac.sh` сравнивает AAC с постоянным шагом той же частоты.
+
+Тесты: клиент `uv run --with 'websockets>=15' --with msgpack python -m pytest -q tests/test_eval_openpi.py`, сервер `third_party/openpi/.venv/bin/python -m pytest -q tests/test_openpi_sample_server.py`.
 
 ## Этапы экспериментов
 

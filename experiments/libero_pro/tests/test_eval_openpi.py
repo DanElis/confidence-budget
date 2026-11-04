@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 from closed_loop import LoopConfig, run_batch  # noqa: E402
-from eval_openpi import make_element, make_infer, pack_array, parse_args, quat2axisangle, unpack_array  # noqa: E402
-from planner import FixedPlanner  # noqa: E402
+from eval_openpi import check_samples, make_element, make_infer, pack_array, parse_args, quat2axisangle, unpack_array  # noqa: E402
+from planner import AdaptivePlanner, FixedPlanner, GivenHStar  # noqa: E402
 
 H = 10
 
@@ -55,7 +55,7 @@ class Client:
         self.horizon, self.calls = horizon, 0
 
     def infer(self, element):
-        assert set(element) == {"observation/image", "observation/wrist_image", "observation/state", "prompt"}
+        assert set(element) == {"observation/image", "observation/wrist_image", "observation/state", "prompt", "noise"}
         self.calls += 1
         return {"actions": np.full((self.horizon, 7), self.calls, dtype=np.float64)}
 
@@ -73,10 +73,69 @@ def test_wrong_horizon_is_an_error_not_a_failed_episode():
 
 
 def test_args():
-    ok = ["--suites", "pos:x0.2", "--out", "x", "--stride", "5"]
+    base = ["--suites", "pos:x0.2", "--out", "x"]
+    ok = base + ["--stride", "5"]
     assert parse_args(ok).horizon == 10 and parse_args(ok).resolution == 256
-    with pytest.raises(SystemExit):
-        parse_args(["--suites", "pos:x0.2", "--out", "x", "--stride", "11"])  # beyond H
+    assert parse_args(base + ["--signal", "aac", "--n-samples", "20"]).stride is None
+    for bad in (base + ["--stride", "11"], base, base + ["--signal", "aac"],  # beyond H; no step; one sample
+                base + ["--signal", "aac", "--n-samples", "20", "--stride", "5"]):
+        with pytest.raises(SystemExit):
+            parse_args(bad)
+
+
+class SampleClient:
+    """As openpi_sample_server.py: the reply follows the noise, deterministically."""
+
+    def __init__(self):
+        self.noises = []
+
+    def infer(self, element):
+        noise = element["noise"]
+        self.noises.append(noise)
+        jump = np.zeros((len(noise), H, 7))
+        jump[:, 7:] = noise[:, :1, :7]  # the samples start to disagree at index 7: Eq. 5 gives h* = 7
+        env = np.zeros((len(noise), H, 7))
+        env[..., 0] = 1.0  # xi = 4
+        env[:, :, 1] = noise[:, 0, 0, None]
+        return {"actions": env, "normalized_action": np.concatenate((jump, np.zeros((len(noise), H, 25))), axis=-1)}
+
+
+def test_aac_runs_chunks_for_h_star_and_executes_sample_0():
+    client = SampleClient()
+    infer = make_infer(client, "task", H, 20, aac=True)
+    res = run_batch([Env()], infer, LoopConfig(H, 0, False, 12, 1), AdaptivePlanner(H, GivenHStar(), s_min=1), [0], (H, 32))
+    assert [c["step"] for c in res.chunks] == [0, 7] and [c["h_star"] for c in res.chunks] == [7, 7]
+    assert all(n.shape == (20, H, 32) for n in client.noises)
+    np.testing.assert_array_equal(res.actions[0, :7, 1], np.full(7, client.noises[0][0, 0, 0]))
+
+
+def test_constant_step_sends_sample_0_of_aac():
+    aac, const = SampleClient(), SampleClient()
+    plan = AdaptivePlanner(H, GivenHStar(), s_min=1)
+    run_batch([Env()], make_infer(aac, "t", H, 20, aac=True), LoopConfig(H, 0, False, 8, 1), plan, [3], (H, 32))
+    run_batch([Env()], make_infer(const, "t", H), LoopConfig(H, 0, False, 8, 1), FixedPlanner(H, 7), [3], (H, 32))
+    assert [len(n) for n in const.noises] == [1, 1]
+    for a, c in zip(aac.noises, const.noises):
+        np.testing.assert_array_equal(a[0], c[0])
+
+
+def test_check_samples():
+    good = SampleClient()
+    good.infer = lambda e: {"normalized_action": e["noise"]}
+    assert check_samples(good, 4, H) == 0
+
+    same = SampleClient()
+    same.infer = lambda e: {"normalized_action": np.zeros_like(e["noise"])}
+    with pytest.raises(RuntimeError, match="coincide"):
+        check_samples(same, 4, H)
+
+    def batch_dependent(e):
+        return {"normalized_action": e["noise"] + len(e["noise"])}
+
+    bad = SampleClient()
+    bad.infer = batch_dependent
+    with pytest.raises(RuntimeError, match="differs"):
+        check_samples(bad, 4, H)
 
 
 def test_eval_libero_resolution_stays_lerobots_by_default():
