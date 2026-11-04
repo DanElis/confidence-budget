@@ -77,10 +77,24 @@ def test_args():
     ok = base + ["--stride", "5"]
     assert parse_args(ok).horizon == 10 and parse_args(ok).resolution == 256
     assert parse_args(base + ["--signal", "aac", "--n-samples", "20"]).stride is None
+    assert parse_args(base + ["--signal", "aac", "--n-samples", "20", "--delay", "5"]).delay == 5
+    assert parse_args(base + ["--stride", "6", "--delay", "4"]).stride == 6
     for bad in (base + ["--stride", "11"], base, base + ["--signal", "aac"],  # beyond H; no step; one sample
-                base + ["--signal", "aac", "--n-samples", "20", "--stride", "5"]):
+                base + ["--signal", "aac", "--n-samples", "20", "--stride", "5"],
+                base + ["--stride", "3", "--delay", "4"], base + ["--stride", "7", "--delay", "4"],  # s < d; s + d > H
+                base + ["--signal", "aac", "--n-samples", "20", "--delay", "6"]):
         with pytest.raises(SystemExit):
             parse_args(bad)
+
+
+@pytest.mark.parametrize(("delay", "starts", "strides"), [(2, [0, 5, 10], [5, 5, 5]), (4, [0, 4, 8], [4, 4, 4])])
+def test_aac_with_delay_keeps_the_old_chunk_for_d_steps(delay, starts, strides):
+    client = SampleClient()
+    infer = make_infer(client, "task", H, 20, aac=True)
+    res = run_batch([Env()], infer, LoopConfig(H, delay, False, 12, 1), AdaptivePlanner(H, GivenHStar(), s_min=1), [0], (H, 32))
+    assert [c["step"] for c in res.chunks] == starts and [c["stride"] for c in res.chunks] == strides  # s = max(7 - d, d)
+    assert res.switch_steps[0][:2] == [0, starts[1] + delay]
+    assert np.isfinite(res.actions[0]).all()  # the plan never runs out
 
 
 class SampleClient:

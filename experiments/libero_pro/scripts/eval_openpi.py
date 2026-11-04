@@ -67,11 +67,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0, help="of the noise")
     p.add_argument("--out", type=Path, required=True)
     a = p.parse_args(argv)
+    # A chunk runs for s + d steps and the next inference must start after the previous switch: d <= s <= H - d.
     if a.signal == "aac":
         if a.stride is not None or a.n_samples < 2:
             p.error("--signal aac takes no --stride and needs --n-samples > 1")
-    elif a.stride is None or not 1 <= a.stride <= a.horizon:
-        p.error(f"need 1 <= --stride <= horizon = {a.horizon}, got {a.stride}")
+        if 2 * a.delay > a.horizon:
+            p.error(f"need 2 d <= H = {a.horizon}, got d={a.delay}")
+    elif a.stride is None or not max(a.delay, 1) <= a.stride <= a.horizon - a.delay:
+        p.error(f"need max(d, 1) <= --stride <= H - d, got s={a.stride}, d={a.delay}, H={a.horizon}")
     return a
 
 
