@@ -12,7 +12,9 @@
 #
 # Usage (from experiments/libero_pro, after setup_openpi.sh; independent of openpi_aac.sh, may run beside it):
 #   tmux new -s aac_async "bash scripts/stages/openpi_aac_async.sh"
-# DELAYS="2 4" K=20 EPISODES_PER_TASK=20 SEED=1 BATCH_K=5 PORT=8780 by default; re-running skips finished suites.
+# DELAYS="2 4" K=20 EPISODES_PER_TASK=20 SEED=1 BATCH_K=5 PORT=8780 by default; re-running skips finished suites and
+# resumes stopped ones after their last finished task. N = 20 took 6-8 h per suite with the prefix repeated per sample.
+SUITE_TIMEOUT=${SUITE_TIMEOUT:-12h}
 cd "$(dirname "$0")/../.." && source scripts/stages/lib.sh
 EPISODES=${EPISODES_PER_TASK:-20}
 DELAYS=${DELAYS:-"2 4"}

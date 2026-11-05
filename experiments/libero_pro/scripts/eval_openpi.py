@@ -181,6 +181,28 @@ def check_samples(client, n_samples: int, horizon: int, action_dim: int = MODEL_
     return diff
 
 
+def progress_key(args) -> dict:
+    """What finished tasks of a suite must have in common with the run that resumes them."""
+    return {k: getattr(args, k) for k in ("stride", "signal", "n_samples", "delay", "horizon", "resolution", "seed",
+                                          "episodes_per_task", "batch_size", "max_steps")}
+
+
+def load_progress(path: Path, key: dict) -> tuple[list, list, list, float]:
+    """Episodes, batches, chunks and seconds of the tasks a stopped run finished."""
+    if not path.exists():
+        return [], [], [], 0.0
+    saved = json.loads(path.read_text())
+    if saved["key"] != key:
+        raise SystemExit(f"{path} was written with other settings: {saved['key']}")
+    return saved["episodes"], saved["batches"], saved["chunks"], saved["seconds"]
+
+
+def save_progress(path: Path, key: dict, episodes: list, batches: list, chunks: list, seconds: float) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"key": key, "episodes": episodes, "batches": batches, "chunks": chunks, "seconds": seconds}))
+    os.replace(tmp, path)
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
@@ -216,9 +238,16 @@ def main() -> None:
             continue
         suite = benchmark.get_benchmark_dict()[name]()
         task_ids = args.task_ids if args.task_ids is not None else list(range(suite.n_tasks))
-        episodes, batches, chunk_log = [], [], []
-        started = time.time()
+        progress = args.out / f"{name}.progress.json"  # a stopped suite resumes after its last finished task
+        key = progress_key(args)
+        episodes, batches, chunk_log, seconds = load_progress(progress, key)
+        finished = {e["task_id"] for e in episodes}
+        if finished:
+            log.info("%s: resuming, tasks %s done in %.0f s", name, sorted(finished), seconds)
+        started = time.time() - seconds
         for tid in task_ids:
+            if tid in finished:
+                continue
             task = suite.get_task(tid)
             infer = make_infer(client, task.language, args.horizon, args.n_samples, aac)
             for start in range(0, args.episodes_per_task, args.batch_size):
@@ -249,10 +278,12 @@ def main() -> None:
                 done = [e for e in episodes if e["task_id"] == tid]
                 log.info("%s task %d: %d/%d success after %d episodes (%.0f s)", name, tid,
                          sum(e["success"] for e in done), len(done), len(done), time.time() - started)
+            save_progress(progress, key, episodes, batches, chunk_log, time.time() - started)
         result = summarize(name, episodes, batches, task_ids)
         result["seconds"] = time.time() - started
-        out_file.write_text(json.dumps(result, indent=1))
         (args.out / f"{name}_chunks.json").write_text(json.dumps(chunk_log))
+        out_file.write_text(json.dumps(result, indent=1))  # last: this file marks the suite as finished
+        progress.unlink(missing_ok=True)
         log.info("%s: success %.1f%% over %d episodes", name, 100 * result["success_rate"], len(episodes))
 
     write_summary(args.out, suites)

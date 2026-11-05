@@ -11,7 +11,9 @@
 # No delay: at H = 10 a large d leaves no room for the step.
 #
 # Usage (from experiments/libero_pro, after openpi_base.sh):  tmux new -s aac_openpi "bash scripts/stages/openpi_aac.sh"
-# K=20 EPISODES_PER_TASK=20 SEED=1 BATCH_K=5 PORT=8770 by default; one server per level; re-running skips finished suites.
+# K=20 EPISODES_PER_TASK=20 SEED=1 BATCH_K=5 PORT=8770 by default; one server per level; re-running skips finished suites
+# and resumes stopped ones after their last finished task.
+SUITE_TIMEOUT=${SUITE_TIMEOUT:-12h}
 cd "$(dirname "$0")/../.." && source scripts/stages/lib.sh
 EPISODES=${EPISODES_PER_TASK:-20}
 K=${K:-20}

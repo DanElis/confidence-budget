@@ -12,7 +12,18 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 from closed_loop import LoopConfig, run_batch  # noqa: E402
-from eval_openpi import check_samples, make_element, make_infer, pack_array, parse_args, quat2axisangle, unpack_array  # noqa: E402
+from eval_openpi import (  # noqa: E402
+    check_samples,
+    load_progress,
+    make_element,
+    make_infer,
+    pack_array,
+    parse_args,
+    progress_key,
+    quat2axisangle,
+    save_progress,
+    unpack_array,
+)
 from planner import AdaptivePlanner, FixedPlanner, GivenHStar  # noqa: E402
 
 H = 10
@@ -131,6 +142,20 @@ def test_constant_step_sends_sample_0_of_aac():
     assert [len(n) for n in const.noises] == [1, 1]
     for a, c in zip(aac.noises, const.noises):
         np.testing.assert_array_equal(a[0], c[0])
+
+
+def test_progress_round_trip_and_settings_guard(tmp_path):
+    args = parse_args(["--suites", "pos:x0.2", "--out", "x", "--stride", "5"])
+    key = progress_key(args)
+    path = tmp_path / "suite.progress.json"
+    assert load_progress(path, key) == ([], [], [], 0.0)
+    save_progress(path, key, [{"task_id": 0}], [{"b": 1}], [{"c": 2}], 12.5)
+    assert load_progress(path, key) == ([{"task_id": 0}], [{"b": 1}], [{"c": 2}], 12.5)
+    assert not path.with_name(path.name + ".tmp").exists()
+    other = progress_key(parse_args(["--suites", "pos:x0.2", "--out", "x", "--stride", "6"]))
+    with pytest.raises(SystemExit):
+        load_progress(path, other)
+    assert progress_key(parse_args(["--suites", "pos:x0.2", "--out", "y", "--stride", "5", "--port", "9"])) == key
 
 
 def test_check_samples():
