@@ -15,7 +15,14 @@ import pytest  # noqa: E402
 jax = pytest.importorskip("jax")
 pytest.importorskip("openpi")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from openpi_sample_server import SamplePolicy, guidance_weight, guided_velocity, sample_shared  # noqa: E402
+from openpi_sample_server import (  # noqa: E402
+    SamplePolicy,
+    guidance_weight,
+    guided_velocity,
+    paper_velocity,
+    sample_paper,
+    sample_shared,
+)
 
 H, A = 10, 32
 
@@ -56,7 +63,7 @@ def make(policy):
         policy.batch_sizes.append(("shared", len(noise)))
         return noise * 2
 
-    return SamplePolicy(policy, H, A, sampler=sampler)
+    return SamplePolicy(policy, H, A, sampler=sampler, paper_sampler=lambda *a, **k: pytest.fail("paper sampler"))
 
 
 @pytest.mark.parametrize(("n", "used"), [(3, "shared"), (1, "stock")])
@@ -95,14 +102,64 @@ def test_guided_velocity_formula():
     np.testing.assert_allclose(out[0, 2:], np.ones((H - 2, A)))
 
 
-def guided_policy(calls):
+def test_paper_velocity_is_the_vjp_on_a_linear_network():
+    """v = a x: x_0 = (1 - t a) x, and the Jacobian multiplies the weighted error by (1 - t a). Without it the factor is 1."""
+    a, t = 0.5, 0.5
+    x = np.full((1, H, A), 2.0, dtype=np.float32)
+    target = np.full((H, A), 4.0, dtype=np.float32)
+    weights = np.zeros((H, A), dtype=np.float32)
+    weights[0, :7] = 1.0
+    out = np.asarray(paper_velocity(lambda z: a * z, x, t, target, weights, 10.0))
+    x_0, error = 2.0 * (1 - t * a), 4.0 - 2.0 * (1 - t * a)
+    assert x_0 == 1.5
+    np.testing.assert_allclose(out[0, 0, :7], np.full(7, a * 2.0 - 2.0 * error * (1 - t * a)), atol=1e-5)  # weight 2 at t = 0.5
+    np.testing.assert_allclose(out[0, 0, 7:], np.full(A - 7, a * 2.0), atol=1e-5)  # zero weight: the plain velocity
+    np.testing.assert_allclose(out[0, 1:], np.full((H - 1, A), a * 2.0), atol=1e-5)
+    plain = np.asarray(guided_velocity(a * x, x, t, target, weights, 10.0))
+    np.testing.assert_allclose(plain[0, 0, 0], a * 2.0 - 2.0 * error, atol=1e-5)  # the two modes differ
+
+
+def guided_policy(calls, paper_calls=None):
     policy = Policy()
 
     def sampler(rng, observation, *, noise, **guidance):
         calls.append(guidance)
         return noise * 2
 
-    return SamplePolicy(policy, H, A, sampler=sampler), policy
+    def paper_sampler(rng, observation, *, noise, **guidance):
+        paper_calls.append(guidance)
+        return noise * 2
+
+    return SamplePolicy(policy, H, A, sampler=sampler, paper_sampler=paper_sampler), policy
+
+
+def test_rtc_jacobian_flag_selects_the_paper_sampler():
+    calls, paper_calls = [], []
+    sample_policy, _ = guided_policy(calls, paper_calls)
+    obs = {"noise": np.zeros((1, H, A), dtype=np.float32), "rtc_target": np.ones((H, A), dtype=np.float32),
+           "rtc_weights": np.ones((H, A), dtype=np.float32), "rtc_max_weight": 5.0, "rtc_jacobian": True}
+    sample_policy.infer(obs)
+    assert not calls and paper_calls[0]["max_weight"] == 5.0 and paper_calls[0]["weights"].shape == (H, A)
+    sample_policy.infer(obs | {"rtc_jacobian": False})
+    assert len(calls) == 1 and len(paper_calls) == 1
+
+
+def test_paper_rtc_on_a_small_real_model():
+    config, model, key = small_model()
+    noise = jax.random.normal(jax.random.key(1), (1, H, config.action_dim))
+    obs = config.fake_obs(1)
+    free = np.asarray(sample_shared(model, key, obs, noise=noise))[0]
+    target = free + 1.0
+    zero = np.zeros((H, A), dtype=np.float32)
+    same = np.asarray(sample_paper(model, key, obs, noise=noise, target=target, weights=zero, max_weight=5.0))[0]
+    np.testing.assert_allclose(same, free, atol=1e-3)  # zero weights: the same as no RTC
+
+    weights = zero.copy()
+    weights[:4, :7] = 1.0
+    guided = np.asarray(sample_paper(model, key, obs, noise=noise, target=target, weights=weights, max_weight=5.0))[0]
+    assert np.abs(guided[:4, :7] - target[:4, :7]).mean() < 0.9  # toward the target, 1.0 away without RTC
+    plain = np.asarray(sample_shared(model, key, obs, noise=noise, target=target, weights=weights, max_weight=5.0))[0]
+    assert np.abs(guided - plain).max() > 1e-4  # the Jacobian changes the result
 
 
 def test_rtc_fields_reach_the_sampler_and_stay_out_of_the_transform():

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# RTC on openpi's pi05_libero, H = 10, with delay, against naive switching at the same constant step and noise.
+# RTC of the paper (Black et al., 2025) on openpi's pi05_libero, H = 10, with delay, against naive switching at the same
+# constant step and noise.
 #
-#   openpi_rtc_s<s>_d<d>     RTC as in eval_libero.py --guidance lerobot: schedule exp, beta 10, mask to H - s
-#   openpi_const_s<s>_d<d>   naive, from openpi_aac_async.sh; must be finished
+#   openpi_rtc_paper_s<s>_d<d>   Eq. 2 with the network's Jacobian, the paper's weights, beta = 5, mask to H - s
+#   openpi_const_s<s>_d<d>       naive, from openpi_aac_async.sh; must be finished
 #
-# H = 10 leaves little to guide: at d = 4, s = 4 freezes 4 actions and softly attaches 2, s = 5 freezes 4 and attaches 1.
-# The delay is simulated. The server checks the guidance on the real model before each suite (check_guidance).
+# Differs from the paper: LIBERO-PRO with this checkpoint and H = 10, and 10 denoising steps, those of openpi and of the
+# naive runs (the paper's real-world runs use 5). H = 10 leaves little to guide: at d = 4, s = 4 freezes 4 actions and
+# softly attaches 2, s = 5 freezes 4 and attaches 1. The delay is simulated, and the extra time of the Jacobian is not
+# added to it. The client checks the guidance on the real model before each suite (check_guidance).
 # Decided before the run. Main comparison at each s: RTC against naive at that s, paired Δ over x0.1-x0.3 with a 95%
 # bootstrap CI; two s: Bonferroni, so a gain counts only if it also holds at 97.5%. Smoothness (|Δa| at the switch, SPARC)
 # is secondary.
@@ -52,7 +55,7 @@ smoke() {
   for s in $STEPS; do
     log=$RUNS/openpi_rtc_smoke_s$s.log
     $OPENPI_PY scripts/eval_openpi.py --suites pos:x0.2 --task-ids 0 --episodes-per-task 2 --batch-size 2 --stride "$s" --delay "$DELAY" \
-        --guidance lerobot --seed "$SEED" --port "$PORT" --out "$RUNS/openpi_rtc_smoke_s$s" > "$log" 2>&1 \
+        --guidance paper --seed "$SEED" --port "$PORT" --out "$RUNS/openpi_rtc_smoke_s$s" > "$log" 2>&1 \
       || { echo "$(date '+%F %T') SMOKE FAILED: s=$s"; tail -20 "$log"; return 1; }
     echo "$(date '+%F %T') smoke s=$s: $(grep -o 'RTC check.*' "$log" | head -1), $(grep -o 'success [0-9.]*%' "$log" | tail -1)"
   done
@@ -83,13 +86,13 @@ MIN_FREE_MB=$SERVERS_FREE_MB wait_for_gpu
 for level in $LEVELS; do start_server "$port" || exit 1; port=$(( port + 1 )); done
 smoke || exit 1
 
-for s in $STEPS; do per_level "openpi_rtc_s${s}_d$DELAY" --stride "$s" --delay "$DELAY" --guidance lerobot; done
+for s in $STEPS; do per_level "openpi_rtc_paper_s${s}_d$DELAY" --stride "$s" --delay "$DELAY" --guidance paper; done
 finish
 stop_servers
 
 : > "$REPORT"
 for s in $STEPS; do
-  $PY scripts/compare.py --ref "$RUNS/openpi_const_s${s}_d$DELAY" "$RUNS/openpi_const_s${s}_d$DELAY" "$RUNS/openpi_rtc_s${s}_d$DELAY" >> "$REPORT"
+  $PY scripts/compare.py --ref "$RUNS/openpi_const_s${s}_d$DELAY" "$RUNS/openpi_const_s${s}_d$DELAY" "$RUNS/openpi_rtc_paper_s${s}_d$DELAY" >> "$REPORT"
 done
 echo "$(date '+%F %T') done: $REPORT"
 }

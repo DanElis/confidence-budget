@@ -10,12 +10,14 @@ Noise is sent with every request, per (seed, episode, step) as in closed_loop.py
 conditions share it while their trajectories coincide. openpi's stock server (scripts/serve_policy.py) ignores it and
 draws its own, and has no N samples: --n-samples, --signal aac and --guidance need scripts/openpi_sample_server.py.
 
---guidance lerobot is RTC as in eval_libero.py: the old plan in model units is the target, its first d actions frozen and
-the soft mask ending at H - s by default, with LeRobot's schedule and without the network's Jacobian.
+RTC: the old plan in model units is the target, its first d actions frozen and the soft mask ending at H - s by default.
+--guidance paper is the RTC paper (Black et al., 2025): Eq. 2 with the Jacobian of the network, its weights, beta = 5, the
+environment's action dimensions only. --guidance lerobot is eval_libero.py's mode: no Jacobian, LeRobot's --schedule,
+beta = 10, all dimensions.
 
     python scripts/eval_openpi.py --suites pos:x0.2 --stride 5 --out runs/openpi_s5 --port 8765
     python scripts/eval_openpi.py --suites pos:x0.2 --signal aac --n-samples 20 --out runs/openpi_aac --port 8765
-    python scripts/eval_openpi.py --suites pos:x0.2 --stride 4 --delay 4 --guidance lerobot --out runs/openpi_rtc --port 8765
+    python scripts/eval_openpi.py --suites pos:x0.2 --stride 4 --delay 4 --guidance paper --out runs/openpi_rtc --port 8765
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ MODEL_ACTION_DIM = 32  # action_dim of the model: the noise has this size, the e
 RESOLUTION = 256  # LIBERO_ENV_RESOLUTION of openpi's and the AAC authors' clients
 SAMPLE_TOLERANCE = 0.05  # normalised units: sample 0 of a batch against the same noise alone
 GUIDANCE_PROBE_SHIFT = 1.0  # normalised units: how far from the free plan check_guidance puts its target
+GUIDANCE_PROBE_MAX = 0.9  # share of that distance the frozen actions may keep, on average
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -65,9 +68,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--signal", choices=["aac"], default=None, help="aac: the step from aac.py, s = max(h* - d, d)")
     p.add_argument("--n-samples", type=int, default=1, help="N samples per request; sample 0 is executed")
     p.add_argument("--delay", type=int, default=0)
-    p.add_argument("--guidance", choices=["none", "lerobot"], default="none", help="lerobot: RTC, needs --delay and --stride")
-    p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"])
-    p.add_argument("--max-guidance-weight", type=float, default=10.0)
+    p.add_argument("--guidance", choices=["none", "paper", "lerobot"], default="none", help="RTC, needs --delay and --stride")
+    p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"], help="--guidance lerobot only")
+    p.add_argument("--max-guidance-weight", type=float, default=None, help="beta; default 5 for paper, 10 for lerobot")
     p.add_argument("--mask-end", type=int, default=None, help="RTC soft-mask end; default H - s")
     p.add_argument("--horizon", type=int, default=HORIZON, help="H the server must return")
     p.add_argument("--resolution", type=int, default=RESOLUTION)
@@ -92,6 +95,8 @@ def parse_args(argv=None) -> argparse.Namespace:
             p.error("--guidance needs one sample per request, a constant --stride and --delay > 0")
         if a.mask_end is not None and not a.delay <= a.mask_end <= a.horizon - a.stride:
             p.error(f"need d <= --mask-end <= H - s, got {a.mask_end}, d={a.delay}, s={a.stride}, H={a.horizon}")
+    if a.max_guidance_weight is None:
+        a.max_guidance_weight = 5.0 if a.guidance == "paper" else 10.0
     return a
 
 
@@ -174,9 +179,23 @@ def make_rtc_weights(schedule: str, max_weight: float, horizon: int):
     return weights
 
 
+def paper_weights(delay: int, mask_end: int, horizon: int, action_dim: int = ACTION_DIM,
+                  model_dim: int = MODEL_ACTION_DIM) -> np.ndarray:
+    """(H, A) weights of the RTC paper: 1 for i < d, c_i (e^c_i - 1) / (e - 1) for d <= i < end, then 0, where
+    c_i = (end - i) / (end - d + 1) and end = H - s. The model's padding dimensions are not actions, so they stay at 0."""
+    row = np.zeros(horizon, dtype=np.float32)
+    row[:delay] = 1.0
+    for i in range(delay, mask_end):
+        c = (mask_end - i) / (mask_end - delay + 1)
+        row[i] = c * (math.exp(c) - 1) / (math.e - 1)
+    weights = np.zeros((horizon, model_dim), dtype=np.float32)
+    weights[:, :action_dim] = row[:, None]
+    return weights
+
+
 def make_infer(client, prompt: str, horizon: int, n_samples: int = 1, aac: bool = False, rtc_weights=None,
-               max_weight: float = 10.0):
-    """rtc_weights (make_rtc_weights): guide toward the old plan, which is then kept in model units."""
+               max_weight: float = 10.0, jacobian: bool = False):
+    """rtc_weights (paper_weights, make_rtc_weights): guide toward the old plan, which is then kept in model units."""
 
     def infer(observations, noise, leftover, delay, mask_end) -> Chunk:
         rows, plans, signal = [], [], []
@@ -184,7 +203,7 @@ def make_infer(client, prompt: str, horizon: int, n_samples: int = 1, aac: bool 
             element = make_element(obs, prompt) | {"noise": expand_noise(row[None], n_samples).numpy()}
             if leftover is not None:
                 element |= {"rtc_target": leftover[i].numpy(), "rtc_weights": rtc_weights(delay, int(mask_end[i])),
-                            "rtc_max_weight": max_weight}
+                            "rtc_max_weight": max_weight, "rtc_jacobian": jacobian}
             reply = client.infer(element)
             actions = np.asarray(reply["actions"], dtype=np.float32)
             if actions.ndim == 2:  # openpi's stock server
@@ -209,22 +228,27 @@ def probe_element() -> dict:
             "prompt": "pick up the milk and place it in the basket"}
 
 
-def check_guidance(client, rtc_weights, delay: int, horizon: int, max_weight: float,
+def check_guidance(client, rtc_weights, delay: int, horizon: int, max_weight: float, jacobian: bool = False,
                    action_dim: int = MODEL_ACTION_DIM) -> tuple[float, float]:
-    """On the real model: zero weights must change nothing, and the frozen actions must reach the target."""
+    """On the real model: zero weights must change nothing, and guidance must move the frozen actions toward the target.
+
+    Only "toward": with the Jacobian the pull is much weaker than without it (RMSE 0.043 against 0.004 on LeRobot).
+    """
     element = probe_element() | {"noise": np.random.default_rng(0).standard_normal((1, horizon, action_dim), dtype=np.float32)}
     free = np.asarray(client.infer(element)["normalized_action"])[0]
     target = free + GUIDANCE_PROBE_SHIFT
 
     def guided(weights):
-        reply = client.infer(element | {"rtc_target": target, "rtc_weights": weights, "rtc_max_weight": max_weight})
+        reply = client.infer(element | {"rtc_target": target, "rtc_weights": weights, "rtc_max_weight": max_weight,
+                                        "rtc_jacobian": jacobian})
         return np.asarray(reply["normalized_action"])[0]
 
     unmasked = float(np.abs(guided(np.zeros(horizon, dtype=np.float32)) - free).max())
     if unmasked > SAMPLE_TOLERANCE:
         raise RuntimeError(f"RTC with zero weights differs from no RTC by {unmasked:.4f}")
-    frozen = float(np.abs(guided(rtc_weights(delay, delay))[:delay] - target[:delay]).max())
-    if frozen > GUIDANCE_PROBE_SHIFT / 2:
+    moved = guided(rtc_weights(delay, delay))[:delay, :ACTION_DIM]
+    frozen = float(np.abs(moved - target[:delay, :ACTION_DIM]).mean())
+    if frozen > GUIDANCE_PROBE_MAX * GUIDANCE_PROBE_SHIFT:
         raise RuntimeError(f"RTC leaves the frozen actions {frozen:.4f} from a target {GUIDANCE_PROBE_SHIFT} away")
     return unmasked, frozen
 
@@ -284,11 +308,12 @@ def main() -> None:
     if args.n_samples > 1:
         log.info("sample 0 of %d against the same noise alone: max diff %.4f", args.n_samples,
                  check_samples(client, args.n_samples, args.horizon))
-    rtc_weights = None
+    rtc_weights, jacobian = None, args.guidance == "paper"
     if args.guidance != "none":
-        rtc_weights = make_rtc_weights(args.schedule, args.max_guidance_weight, args.horizon)
+        rtc_weights = ((lambda delay, end: paper_weights(delay, end, args.horizon)) if jacobian
+                       else make_rtc_weights(args.schedule, args.max_guidance_weight, args.horizon))
         log.info("RTC check: zero weights differ by %.4f, frozen actions %.4f from the target",
-                 *check_guidance(client, rtc_weights, args.delay, args.horizon, args.max_guidance_weight))
+                 *check_guidance(client, rtc_weights, args.delay, args.horizon, args.max_guidance_weight, jacobian))
     planner = (AdaptivePlanner(args.horizon, GivenHStar(), s_min=1) if aac
                else FixedPlanner(args.horizon, args.stride, args.mask_end))
     cfg = LoopConfig(args.horizon, args.delay, rtc_weights is not None, args.max_steps, args.seed)
@@ -320,7 +345,8 @@ def main() -> None:
             if tid in finished:
                 continue
             task = suite.get_task(tid)
-            infer = make_infer(client, task.language, args.horizon, args.n_samples, aac, rtc_weights, args.max_guidance_weight)
+            infer = make_infer(client, task.language, args.horizon, args.n_samples, aac, rtc_weights,
+                               args.max_guidance_weight, jacobian)
             for start in range(0, args.episodes_per_task, args.batch_size):
                 ids = list(range(start, min(start + args.batch_size, args.episodes_per_task)))
                 envs = [LiberoEnv(task_suite=suite, task_id=tid, task_suite_name=name, camera_name=camera_names,

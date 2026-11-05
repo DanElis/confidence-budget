@@ -20,6 +20,7 @@ from eval_openpi import (  # noqa: E402
     make_infer,
     make_rtc_weights,
     pack_array,
+    paper_weights,
     parse_args,
     progress_key,
     quat2axisangle,
@@ -215,6 +216,30 @@ def test_rtc_sends_the_old_plan_in_model_units(stride, mask_end, left):
     # the robot executes environment actions, and chunk 1 keeps running for d steps after the second request
     np.testing.assert_array_equal(res.actions[0, : stride + 4, 0], np.full(stride + 4, 1.0))
     assert res.actions[0, stride + 4, 0] == 2.0
+
+
+@pytest.mark.parametrize(("end", "soft"), [(6, [0.3682, 0.0768]), (5, [0.2036])])
+def test_paper_weights(end, soft):
+    # c = 2/3, 1/3 at end = 6; c = 1/2 at end = 5; weight = c (e^c - 1) / (e - 1)
+    w = paper_weights(4, end, H)
+    assert w.shape == (H, 32)
+    np.testing.assert_allclose(w[:4, :7], np.ones((4, 7)))
+    np.testing.assert_allclose(w[4:end, 0], soft, atol=1e-3)
+    assert (w[end:] == 0).all() and (w[:, 7:] == 0).all()  # past the old plan; the model's padding dimensions
+
+
+def test_paper_mode_sends_the_jacobian_flag_and_beta_5():
+    base = ["--suites", "pos:x0.2", "--out", "x", "--stride", "4", "--delay", "4"]
+    paper = parse_args(base + ["--guidance", "paper"])
+    assert paper.max_guidance_weight == 5.0
+    assert parse_args(base + ["--guidance", "lerobot"]).max_guidance_weight == 10.0
+    assert progress_key(paper)["guidance"] == "paper"
+
+    client = RtcClient()
+    infer = make_infer(client, "t", H, rtc_weights=lambda d, e: paper_weights(d, e, H), max_weight=5.0, jacobian=True)
+    run_batch([Env()], infer, LoopConfig(H, 4, True, 5, 1), FixedPlanner(H, 4), [0], (H, 32))
+    assert client.elements[1]["rtc_jacobian"] is True and client.elements[1]["rtc_max_weight"] == 5.0
+    assert client.elements[1]["rtc_weights"].shape == (H, 32)
 
 
 def test_rtc_and_naive_share_the_noise():
