@@ -218,7 +218,7 @@ def test_rtc_sends_the_old_plan_in_model_units(stride, mask_end, left):
     assert res.actions[0, stride + 4, 0] == 2.0
 
 
-@pytest.mark.parametrize(("end", "soft"), [(6, [0.3682, 0.0768]), (5, [0.2036])])
+@pytest.mark.parametrize(("end", "soft"), [(6, [0.3677, 0.0767]), (5, [0.1888])])
 def test_paper_weights(end, soft):
     # c = 2/3, 1/3 at end = 6; c = 1/2 at end = 5; weight = c (e^c - 1) / (e - 1)
     w = paper_weights(4, end, H)
