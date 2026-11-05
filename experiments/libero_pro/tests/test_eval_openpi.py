@@ -13,10 +13,12 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 from closed_loop import LoopConfig, run_batch  # noqa: E402
 from eval_openpi import (  # noqa: E402
+    check_guidance,
     check_samples,
     load_progress,
     make_element,
     make_infer,
+    make_rtc_weights,
     pack_array,
     parse_args,
     progress_key,
@@ -175,6 +177,113 @@ def test_check_samples():
     bad.infer = batch_dependent
     with pytest.raises(RuntimeError, match="differs"):
         check_samples(bad, 4, H)
+
+
+class RtcClient:
+    """Each reply: the environment actions hold the call number, the plan in model units is distinct per call and index."""
+
+    def __init__(self):
+        self.elements = []
+
+    def infer(self, element):
+        self.elements.append(element)
+        call = len(self.elements)
+        plan = np.full((1, H, 32), float(call), dtype=np.float32)
+        plan[0, :, 0] += np.arange(H) / 100
+        return {"actions": np.full((1, H, 7), call, dtype=np.float64), "normalized_action": plan}
+
+
+def fake_weights(delay, mask_end):
+    return np.array([delay, mask_end] + [0] * (H - 2), dtype=np.float32)
+
+
+@pytest.mark.parametrize(("stride", "mask_end", "left"), [(4, None, 6), (5, None, 5), (4, 5, 6)])
+def test_rtc_sends_the_old_plan_in_model_units(stride, mask_end, left):
+    client = RtcClient()
+    infer = make_infer(client, "task", H, rtc_weights=fake_weights, max_weight=7.0)
+    res = run_batch([Env()], infer, LoopConfig(H, 4, True, 2 * stride + 1, 1), FixedPlanner(H, stride, mask_end), [0], (H, 32))
+    first, second, third = client.elements
+    assert "rtc_target" not in first  # the first chunk has no old plan
+    plan = np.full((H, 32), 1.0, dtype=np.float32)
+    plan[:, 0] += np.arange(H) / 100
+    np.testing.assert_array_equal(second["rtc_target"][:left], plan[stride:])
+    assert (second["rtc_target"][left:] == 0).all()  # past the end of the old plan
+    np.testing.assert_array_equal(second["rtc_weights"][:2], [4, H - stride if mask_end is None else mask_end])
+    assert second["rtc_max_weight"] == 7.0
+    # s >= d: chunk 2 has taken over by the third request, so it is the old plan there
+    np.testing.assert_array_equal(third["rtc_target"][0, 1:], np.full(31, 2.0, dtype=np.float32))
+    # the robot executes environment actions, and chunk 1 keeps running for d steps after the second request
+    np.testing.assert_array_equal(res.actions[0, : stride + 4, 0], np.full(stride + 4, 1.0))
+    assert res.actions[0, stride + 4, 0] == 2.0
+
+
+def test_rtc_and_naive_share_the_noise():
+    rtc, naive = RtcClient(), RtcClient()
+    plan = FixedPlanner(H, 4)
+    run_batch([Env()], make_infer(rtc, "t", H, rtc_weights=fake_weights), LoopConfig(H, 4, True, 9, 1), plan, [3], (H, 32))
+    run_batch([Env()], make_infer(naive, "t", H), LoopConfig(H, 4, False, 9, 1), plan, [3], (H, 32))
+    assert len(rtc.elements) == len(naive.elements)
+    for a, b in zip(rtc.elements, naive.elements):
+        np.testing.assert_array_equal(a["noise"], b["noise"])
+        assert "rtc_target" not in b
+
+
+def test_rtc_args_and_progress_key():
+    base = ["--suites", "pos:x0.2", "--out", "x"]
+    rtc = base + ["--stride", "4", "--delay", "4", "--guidance", "lerobot"]
+    assert parse_args(rtc).guidance == "lerobot" and parse_args(rtc + ["--mask-end", "5"]).mask_end == 5
+    for bad in (base + ["--stride", "5", "--guidance", "lerobot"],  # no delay
+                base + ["--signal", "aac", "--n-samples", "20", "--delay", "4", "--guidance", "lerobot"],
+                base + ["--stride", "4", "--delay", "4", "--mask-end", "5"],  # a mask without RTC
+                rtc + ["--mask-end", "3"], rtc + ["--mask-end", "7"]):  # mask_end < d; mask_end > H - s
+        with pytest.raises(SystemExit):
+            parse_args(bad)
+    plain = progress_key(parse_args(base + ["--stride", "4", "--delay", "4"]))
+    assert "guidance" not in plain  # runs without RTC resume from the progress files they already wrote
+    assert progress_key(parse_args(rtc))["guidance"] == "lerobot"
+    assert progress_key(parse_args(rtc)) != progress_key(parse_args(rtc + ["--mask-end", "5"]))
+
+
+def test_rtc_weights_freeze_d_actions_and_end_at_the_mask():
+    pytest.importorskip("lerobot")
+    w = make_rtc_weights("exp", 10.0, H)(4, 6)
+    assert w.shape == (H,)
+    np.testing.assert_array_equal(w[:4], np.ones(4))
+    np.testing.assert_array_equal(w[6:], np.zeros(4))
+    assert ((w[4:6] >= 0) & (w[4:6] <= 1)).all() and w[4] >= w[5]
+    np.testing.assert_array_equal(make_rtc_weights("exp", 10.0, H)(4, 4), [1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
+
+
+@pytest.mark.parametrize(("t", "weight"), [(1.0, 10.0), (0.5, 2.0), (0.1, 9.1111)])
+def test_guidance_weight_table_shared_with_the_server(t, weight):
+    """The same table is in test_openpi_sample_server.py, which runs in openpi's venv without LeRobot."""
+    pytest.importorskip("lerobot")
+    from h1.guidance import guidance_weight
+
+    assert float(guidance_weight(t, 10.0)) == pytest.approx(weight, abs=1e-3)
+
+
+class GuidanceServer:
+    def __init__(self, frozen_error=0.0, ignore=False, zero_shift=0.0):
+        self.frozen_error, self.ignore, self.zero_shift = frozen_error, ignore, zero_shift
+
+    def infer(self, element):
+        free = element["noise"].copy()
+        if "rtc_target" not in element or self.ignore:
+            return {"normalized_action": free}
+        w = element["rtc_weights"][None, :, None]
+        if not w.any():
+            return {"normalized_action": free + self.zero_shift}
+        return {"normalized_action": w * (element["rtc_target"][None] + self.frozen_error) + (1 - w) * free}
+
+
+def test_check_guidance():
+    weights = lambda delay, end: (np.arange(H) < delay).astype(np.float32)  # noqa: E731
+    assert check_guidance(GuidanceServer(frozen_error=0.1), weights, 4, H, 10.0) == (0.0, pytest.approx(0.1, abs=1e-4))
+    with pytest.raises(RuntimeError, match="frozen"):
+        check_guidance(GuidanceServer(ignore=True), weights, 4, H, 10.0)  # openpi's stock server
+    with pytest.raises(RuntimeError, match="zero weights"):
+        check_guidance(GuidanceServer(zero_shift=0.1), weights, 4, H, 10.0)
 
 
 def test_eval_libero_resolution_stays_lerobots_by_default():

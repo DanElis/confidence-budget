@@ -8,10 +8,14 @@ actions are executed as they are.
 
 Noise is sent with every request, per (seed, episode, step) as in closed_loop.py, and the executed sample is number 0, so
 conditions share it while their trajectories coincide. openpi's stock server (scripts/serve_policy.py) ignores it and
-draws its own, and has no N samples: --n-samples and --signal aac need scripts/openpi_sample_server.py.
+draws its own, and has no N samples: --n-samples, --signal aac and --guidance need scripts/openpi_sample_server.py.
+
+--guidance lerobot is RTC as in eval_libero.py: the old plan in model units is the target, its first d actions frozen and
+the soft mask ending at H - s by default, with LeRobot's schedule and without the network's Jacobian.
 
     python scripts/eval_openpi.py --suites pos:x0.2 --stride 5 --out runs/openpi_s5 --port 8765
     python scripts/eval_openpi.py --suites pos:x0.2 --signal aac --n-samples 20 --out runs/openpi_aac --port 8765
+    python scripts/eval_openpi.py --suites pos:x0.2 --stride 4 --delay 4 --guidance lerobot --out runs/openpi_rtc --port 8765
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ HORIZON = 10  # action_horizon of the pi05_libero config at the pinned openpi co
 MODEL_ACTION_DIM = 32  # action_dim of the model: the noise has this size, the environment reads the first 7
 RESOLUTION = 256  # LIBERO_ENV_RESOLUTION of openpi's and the AAC authors' clients
 SAMPLE_TOLERANCE = 0.05  # normalised units: sample 0 of a batch against the same noise alone
+GUIDANCE_PROBE_SHIFT = 1.0  # normalised units: how far from the free plan check_guidance puts its target
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -60,6 +65,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--signal", choices=["aac"], default=None, help="aac: the step from aac.py, s = max(h* - d, d)")
     p.add_argument("--n-samples", type=int, default=1, help="N samples per request; sample 0 is executed")
     p.add_argument("--delay", type=int, default=0)
+    p.add_argument("--guidance", choices=["none", "lerobot"], default="none", help="lerobot: RTC, needs --delay and --stride")
+    p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"])
+    p.add_argument("--max-guidance-weight", type=float, default=10.0)
+    p.add_argument("--mask-end", type=int, default=None, help="RTC soft-mask end; default H - s")
     p.add_argument("--horizon", type=int, default=HORIZON, help="H the server must return")
     p.add_argument("--resolution", type=int, default=RESOLUTION)
     p.add_argument("--host", default="127.0.0.1")
@@ -75,6 +84,14 @@ def parse_args(argv=None) -> argparse.Namespace:
             p.error(f"need 2 d <= H = {a.horizon}, got d={a.delay}")
     elif a.stride is None or not max(a.delay, 1) <= a.stride <= a.horizon - a.delay:
         p.error(f"need max(d, 1) <= --stride <= H - d, got s={a.stride}, d={a.delay}, H={a.horizon}")
+    if a.guidance == "none":
+        if a.mask_end is not None:
+            p.error("--mask-end needs --guidance")
+    else:
+        if a.signal is not None or a.n_samples != 1 or a.delay < 1:
+            p.error("--guidance needs one sample per request, a constant --stride and --delay > 0")
+        if a.mask_end is not None and not a.delay <= a.mask_end <= a.horizon - a.stride:
+            p.error(f"need d <= --mask-end <= H - s, got {a.mask_end}, d={a.delay}, s={a.stride}, H={a.horizon}")
     return a
 
 
@@ -145,11 +162,29 @@ def make_element(obs: dict, prompt: str) -> dict:
     }
 
 
-def make_infer(client, prompt: str, horizon: int, n_samples: int = 1, aac: bool = False):
+def make_rtc_weights(schedule: str, max_weight: float, horizon: int):
+    """(delay, mask_end) -> (H,) weights, computed by the code the LeRobot runs use."""
+    from h1.guidance import BatchRTCProcessor, make_rtc_config
+
+    processor = BatchRTCProcessor(make_rtc_config(schedule, max_weight, horizon), jacobian=False)
+
+    def weights(delay: int, mask_end: int) -> np.ndarray:
+        return processor.prefix_weights(delay, mask_end, 1, horizon, horizon)[0].numpy().astype(np.float32)
+
+    return weights
+
+
+def make_infer(client, prompt: str, horizon: int, n_samples: int = 1, aac: bool = False, rtc_weights=None,
+               max_weight: float = 10.0):
+    """rtc_weights (make_rtc_weights): guide toward the old plan, which is then kept in model units."""
+
     def infer(observations, noise, leftover, delay, mask_end) -> Chunk:
-        rows, signal = [], []
-        for obs, row in zip(observations, noise):
+        rows, plans, signal = [], [], []
+        for i, (obs, row) in enumerate(zip(observations, noise)):
             element = make_element(obs, prompt) | {"noise": expand_noise(row[None], n_samples).numpy()}
+            if leftover is not None:
+                element |= {"rtc_target": leftover[i].numpy(), "rtc_weights": rtc_weights(delay, int(mask_end[i])),
+                            "rtc_max_weight": max_weight}
             reply = client.infer(element)
             actions = np.asarray(reply["actions"], dtype=np.float32)
             if actions.ndim == 2:  # openpi's stock server
@@ -157,19 +192,46 @@ def make_infer(client, prompt: str, horizon: int, n_samples: int = 1, aac: bool 
             if actions.shape != (n_samples, horizon, ACTION_DIM):
                 raise RuntimeError(f"server returned actions {actions.shape}, expected {(n_samples, horizon, ACTION_DIM)}")
             rows.append(actions[0])
+            if rtc_weights is not None:
+                plans.append(np.asarray(reply["normalized_action"], dtype=np.float32)[0])
             if aac:
                 signal.append(paper_h_star(np.asarray(reply["normalized_action"])[..., :ACTION_DIM], actions))
         actions = np.stack(rows)
-        return Chunk(torch.from_numpy(actions.copy()), actions, signal=np.array(signal) if aac else None)
+        model = np.stack(plans) if rtc_weights is not None else actions
+        return Chunk(torch.from_numpy(model.copy()), actions, signal=np.array(signal) if aac else None)
 
     return infer
 
 
+def probe_element() -> dict:
+    image = np.zeros((RESOLUTION, RESOLUTION, 3), dtype=np.uint8)
+    return {"observation/image": image, "observation/wrist_image": image, "observation/state": np.zeros(8),
+            "prompt": "pick up the milk and place it in the basket"}
+
+
+def check_guidance(client, rtc_weights, delay: int, horizon: int, max_weight: float,
+                   action_dim: int = MODEL_ACTION_DIM) -> tuple[float, float]:
+    """On the real model: zero weights must change nothing, and the frozen actions must reach the target."""
+    element = probe_element() | {"noise": np.random.default_rng(0).standard_normal((1, horizon, action_dim), dtype=np.float32)}
+    free = np.asarray(client.infer(element)["normalized_action"])[0]
+    target = free + GUIDANCE_PROBE_SHIFT
+
+    def guided(weights):
+        reply = client.infer(element | {"rtc_target": target, "rtc_weights": weights, "rtc_max_weight": max_weight})
+        return np.asarray(reply["normalized_action"])[0]
+
+    unmasked = float(np.abs(guided(np.zeros(horizon, dtype=np.float32)) - free).max())
+    if unmasked > SAMPLE_TOLERANCE:
+        raise RuntimeError(f"RTC with zero weights differs from no RTC by {unmasked:.4f}")
+    frozen = float(np.abs(guided(rtc_weights(delay, delay))[:delay] - target[:delay]).max())
+    if frozen > GUIDANCE_PROBE_SHIFT / 2:
+        raise RuntimeError(f"RTC leaves the frozen actions {frozen:.4f} from a target {GUIDANCE_PROBE_SHIFT} away")
+    return unmasked, frozen
+
+
 def check_samples(client, n_samples: int, horizon: int, action_dim: int = MODEL_ACTION_DIM) -> float:
     """The batch must behave as single requests: sample 0 as with its noise alone, and the samples must differ."""
-    image = np.zeros((RESOLUTION, RESOLUTION, 3), dtype=np.uint8)
-    element = {"observation/image": image, "observation/wrist_image": image, "observation/state": np.zeros(8),
-               "prompt": "pick up the milk and place it in the basket"}
+    element = probe_element()
     noise = np.random.default_rng(0).standard_normal((n_samples, horizon, action_dim), dtype=np.float32)
     many = np.asarray(client.infer(element | {"noise": noise})["normalized_action"])
     one = np.asarray(client.infer(element | {"noise": noise[:1]})["normalized_action"])
@@ -183,8 +245,11 @@ def check_samples(client, n_samples: int, horizon: int, action_dim: int = MODEL_
 
 def progress_key(args) -> dict:
     """What finished tasks of a suite must have in common with the run that resumes them."""
-    return {k: getattr(args, k) for k in ("stride", "signal", "n_samples", "delay", "horizon", "resolution", "seed",
-                                          "episodes_per_task", "batch_size", "max_steps")}
+    names = ["stride", "signal", "n_samples", "delay", "horizon", "resolution", "seed", "episodes_per_task", "batch_size",
+             "max_steps"]
+    if args.guidance != "none":  # only with RTC: progress files of runs without it stay valid
+        names += ["guidance", "schedule", "max_guidance_weight", "mask_end"]
+    return {k: getattr(args, k) for k in names}
 
 
 def load_progress(path: Path, key: dict) -> tuple[list, list, list, float]:
@@ -219,8 +284,14 @@ def main() -> None:
     if args.n_samples > 1:
         log.info("sample 0 of %d against the same noise alone: max diff %.4f", args.n_samples,
                  check_samples(client, args.n_samples, args.horizon))
-    planner = AdaptivePlanner(args.horizon, GivenHStar(), s_min=1) if aac else FixedPlanner(args.horizon, args.stride)
-    cfg = LoopConfig(args.horizon, args.delay, False, args.max_steps, args.seed)
+    rtc_weights = None
+    if args.guidance != "none":
+        rtc_weights = make_rtc_weights(args.schedule, args.max_guidance_weight, args.horizon)
+        log.info("RTC check: zero weights differ by %.4f, frozen actions %.4f from the target",
+                 *check_guidance(client, rtc_weights, args.delay, args.horizon, args.max_guidance_weight))
+    planner = (AdaptivePlanner(args.horizon, GivenHStar(), s_min=1) if aac
+               else FixedPlanner(args.horizon, args.stride, args.mask_end))
+    cfg = LoopConfig(args.horizon, args.delay, rtc_weights is not None, args.max_steps, args.seed)
     env_cfg = LiberoEnvConfig(task=suites[0], episode_length=args.max_steps, observation_height=args.resolution,
                               observation_width=args.resolution)
     camera_names = parse_camera_names(env_cfg.camera_name)
@@ -249,7 +320,7 @@ def main() -> None:
             if tid in finished:
                 continue
             task = suite.get_task(tid)
-            infer = make_infer(client, task.language, args.horizon, args.n_samples, aac)
+            infer = make_infer(client, task.language, args.horizon, args.n_samples, aac, rtc_weights, args.max_guidance_weight)
             for start in range(0, args.episodes_per_task, args.batch_size):
                 ids = list(range(start, min(start + args.batch_size, args.episodes_per_task)))
                 envs = [LiberoEnv(task_suite=suite, task_id=tid, task_suite_name=name, camera_name=camera_names,

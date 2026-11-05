@@ -15,7 +15,7 @@ import pytest  # noqa: E402
 jax = pytest.importorskip("jax")
 pytest.importorskip("openpi")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from openpi_sample_server import SamplePolicy, sample_shared  # noqa: E402
+from openpi_sample_server import SamplePolicy, guidance_weight, guided_velocity, sample_shared  # noqa: E402
 
 H, A = 10, 32
 
@@ -75,6 +75,82 @@ def test_samples(n, used):
 def test_wrong_noise_is_refused(shape):
     with pytest.raises(ValueError, match="noise"):
         make(Policy()).infer({"noise": np.zeros(shape, dtype=np.float32)})
+
+
+@pytest.mark.parametrize(("t", "weight"), [(1.0, 10.0), (0.5, 2.0), (0.1, 9.1111)])
+def test_guidance_weight_table_shared_with_the_client(t, weight):
+    """The same table is in test_eval_openpi.py, against h1.guidance.guidance_weight of the LeRobot runs."""
+    assert float(guidance_weight(jax.numpy.float32(t), 10.0)) == pytest.approx(weight, abs=1e-3)
+
+
+def test_guided_velocity_formula():
+    x = np.full((1, H, A), 2.0, dtype=np.float32)
+    v = np.full((1, H, A), 1.0, dtype=np.float32)
+    target = np.full((H, A), 4.0, dtype=np.float32)
+    weights = np.zeros(H, dtype=np.float32)
+    weights[0], weights[1] = 1.0, 0.5
+    out = np.asarray(guided_velocity(v, x, 0.5, target, weights, 10.0))  # x_0 = 2 - 0.5 = 1.5, error 2.5, weight 2
+    np.testing.assert_allclose(out[0, 0], np.full(A, 1.0 - 2 * 2.5))
+    np.testing.assert_allclose(out[0, 1], np.full(A, 1.0 - 2 * 2.5 * 0.5))
+    np.testing.assert_allclose(out[0, 2:], np.ones((H - 2, A)))
+
+
+def guided_policy(calls):
+    policy = Policy()
+
+    def sampler(rng, observation, *, noise, **guidance):
+        calls.append(guidance)
+        return noise * 2
+
+    return SamplePolicy(policy, H, A, sampler=sampler), policy
+
+
+def test_rtc_fields_reach_the_sampler_and_stay_out_of_the_transform():
+    calls = []
+    sample_policy, policy = guided_policy(calls)
+    target, weights = np.ones((H, A), dtype=np.float32), np.ones(H, dtype=np.float32)
+    obs = {"noise": np.zeros((1, H, A), dtype=np.float32), "rtc_target": target, "rtc_weights": weights, "rtc_max_weight": 7.0}
+    sample_policy.infer(obs)  # Policy._sample_actions would fail the assertion below: N = 1 with RTC is not the stock path
+    assert policy.batch_sizes == [] and "rtc_target" in obs
+    np.testing.assert_array_equal(calls[0]["target"], target)
+    np.testing.assert_array_equal(calls[0]["weights"], weights)
+    assert calls[0]["max_weight"] == 7.0
+
+
+@pytest.mark.parametrize("fields", [
+    {"rtc_target": np.zeros((H, A))},
+    {"rtc_target": np.zeros((H, A)), "rtc_weights": np.zeros(H)},
+    {"rtc_target": np.zeros((H, 7)), "rtc_weights": np.zeros(H), "rtc_max_weight": 10.0},
+    {"rtc_target": np.zeros((H, A)), "rtc_weights": np.zeros(5), "rtc_max_weight": 10.0},
+])
+def test_incomplete_or_wrong_rtc_is_refused(fields):
+    sample_policy, _ = guided_policy([])
+    with pytest.raises(ValueError, match="rtc"):
+        sample_policy.infer({"noise": np.zeros((1, H, A), dtype=np.float32)} | fields)
+
+
+def small_model():
+    from openpi.models import pi0_config
+
+    config = pi0_config.Pi0Config(pi05=True, action_horizon=H, discrete_state_input=False, paligemma_variant="dummy",
+                                  action_expert_variant="dummy")
+    key = jax.random.key(0)
+    return config, config.create(key), key
+
+
+def test_rtc_on_a_small_real_model():
+    config, model, key = small_model()
+    noise = jax.random.normal(jax.random.key(1), (1, H, config.action_dim))
+    obs = config.fake_obs(1)
+    free = np.asarray(sample_shared(model, key, obs, noise=noise))[0]
+    target = free + 1.0
+
+    zero = np.asarray(sample_shared(model, key, obs, noise=noise, target=target, weights=np.zeros(H, dtype=np.float32)))[0]
+    np.testing.assert_allclose(zero, free, atol=1e-3)  # zero weights: the same as no RTC
+
+    weights = (np.arange(H) < 4).astype(np.float32)
+    guided = np.asarray(sample_shared(model, key, obs, noise=noise, target=target, weights=weights))[0]
+    assert np.abs(guided[:4] - target[:4]).max() < 0.5  # the frozen actions reach the target, 1.0 away without RTC
 
 
 def test_sample_shared_equals_openpis_sampler_on_a_repeated_observation():
