@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 from closed_loop import LoopConfig, run_batch  # noqa: E402
 from eval_openpi import (  # noqa: E402
+    RtcGate,
     check_guidance,
     check_samples,
     load_progress,
@@ -309,6 +310,85 @@ def test_check_guidance():
         check_guidance(GuidanceServer(ignore=True), weights, 4, H, 10.0)  # openpi's stock server
     with pytest.raises(RuntimeError, match="zero weights"):
         check_guidance(GuidanceServer(zero_shift=0.1), weights, 4, H, 10.0)
+
+
+class GateClient:
+    """Unguided replies hold 1.0, guided ones 7.0, in the plan and in the environment actions alike."""
+
+    def __init__(self):
+        self.elements = []
+
+    def infer(self, element):
+        self.elements.append(element)
+        value = 7.0 if "rtc_target" in element else 1.0
+        return {"actions": np.full((1, H, 7), value), "normalized_action": np.full((1, H, 32), value, dtype=np.float32)}
+
+
+def gate_run(client, gate, guidance=True, steps=11):
+    infer = make_infer(client, "t", H, rtc_weights=fake_weights, gate=gate) if guidance else make_infer(client, "t", H)
+    return run_batch([Env()], infer, LoopConfig(H, 4, guidance, steps, 1), FixedPlanner(H, 5), [0], (H, 32), keep_entropy=True)
+
+
+def test_divergence_gate_guides_only_where_the_plans_agree():
+    client = GateClient()
+    res = gate_run(client, RtcGate("divergence", overlap=H - 5, tau=0.5))
+    first, second, third = res.chunks
+    assert (first["divergence"], first["guided"], first["calls"]) == (-1.0, 0.0, 1.0)  # no old plan yet
+    # request at t = 5: free plan 1.0 against the old plan 1.0, D = 0 < tau: guided, a second call
+    assert (second["divergence"], second["guided"], second["calls"]) == (0.0, 1.0, 2.0)
+    # request at t = 10: free 1.0 against the guided old plan 7.0, D = 6: the unguided chunk runs
+    assert (third["divergence"], third["guided"], third["calls"]) == (6.0, 0.0, 1.0)
+    assert len(client.elements) == 4  # t = 0; t = 5 free and guided; t = 10 free
+    assert "rtc_target" not in client.elements[1] and "rtc_target" in client.elements[2]  # unguided first, then guided
+    np.testing.assert_array_equal(client.elements[1]["noise"], client.elements[2]["noise"])  # the same noise
+    np.testing.assert_array_equal(res.actions[0, :9, 0], np.ones(9))  # chunk 1 until t + d = 9
+    assert res.actions[0, 9, 0] == 7.0  # then the guided chunk 2
+
+
+def test_divergence_uses_the_overlap_and_the_action_dimensions_only():
+    gate = RtcGate("divergence", overlap=5, tau=1.0)
+    plan, old = np.zeros((H, 32)), np.zeros((H, 32))
+    old[:5, :7] = 0.5
+    old[5:] = 100.0  # beyond the overlap
+    old[:, 7:] = 100.0  # the model's padding
+    assert gate.divergence(plan, old) == pytest.approx(0.5)
+
+
+def test_tau_0_is_naive_with_the_divergence_logged():
+    gated, naive = GateClient(), GateClient()
+    res = gate_run(gated, RtcGate("divergence", overlap=H - 5, tau=0.0))
+    ref = gate_run(naive, None, guidance=False)
+    assert all("rtc_target" not in e for e in gated.elements) and len(gated.elements) == len(naive.elements)
+    for a, b in zip(gated.elements, naive.elements):
+        np.testing.assert_array_equal(a["noise"], b["noise"])
+    np.testing.assert_array_equal(res.actions, ref.actions)
+    assert [c["guided"] for c in res.chunks] == [0.0, 0.0, 0.0] and res.chunks[1]["divergence"] == 0.0
+
+
+def test_random_gate_is_a_coin_of_the_noise_not_of_the_state():
+    gate = RtcGate("random", overlap=5, share=0.3, seed=1)
+    rng = np.random.default_rng(0)
+    noises = [rng.standard_normal((1, H, 32)).astype(np.float32) for _ in range(2000)]
+    coins = [gate.guide(0.0, n) for n in noises]
+    assert abs(np.mean(coins) - 0.3) < 0.04
+    assert [gate.guide(5.0, n) for n in noises[:50]] == coins[:50]  # whatever D is
+    assert RtcGate("random", 5, share=0.0).guide(0.0, noises[0]) is False
+    assert RtcGate("random", 5, share=1.0).guide(0.0, noises[0]) is True
+
+
+def test_gate_args_and_progress_key():
+    base = ["--suites", "pos:y0.2", "--out", "x", "--stride", "5", "--delay", "4"]
+    rtc = base + ["--guidance", "paper"]
+    a = parse_args(rtc + ["--rtc-gate", "divergence", "--rtc-tau", "0"])
+    assert a.rtc_tau == 0 and progress_key(a)["rtc_gate"] == "divergence"
+    assert parse_args(rtc + ["--rtc-gate", "random", "--rtc-share", "0.4"]).rtc_share == 0.4
+    assert "rtc_gate" not in progress_key(parse_args(rtc))  # runs without a gate resume as before
+    for bad in (base + ["--rtc-gate", "divergence", "--rtc-tau", "0.1"],  # no guidance
+                rtc + ["--rtc-gate", "divergence"], rtc + ["--rtc-gate", "divergence", "--rtc-tau", "-1"],
+                rtc + ["--rtc-gate", "random"], rtc + ["--rtc-gate", "random", "--rtc-share", "1.5"],
+                rtc + ["--rtc-gate", "random", "--rtc-share", "0.5", "--rtc-tau", "0.1"], rtc + ["--rtc-tau", "0.1"]):
+        with pytest.raises(SystemExit):
+            parse_args(bad)
 
 
 def test_eval_libero_resolution_stays_lerobots_by_default():

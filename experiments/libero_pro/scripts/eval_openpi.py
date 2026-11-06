@@ -15,9 +15,17 @@ RTC: the old plan in model units is the target, its first d actions frozen and t
 environment's action dimensions only. --guidance lerobot is eval_libero.py's mode: no Jacobian, LeRobot's --schedule,
 beta = 10, all dimensions.
 
+--rtc-gate decides per request whether to guide. The chunk is first generated without guidance, as naive would (same
+noise, same request); D = mean |new - old| over the overlap with the old plan (i < H - s, the 7 action dimensions, model
+units). divergence: guide (a second call, same noise) if D < --rtc-tau, else execute the unguided chunk, which is then
+exactly naive's. random: guide with probability --rtc-share, independent of the state, the control at equal share.
+--rtc-tau 0 never guides: naive execution with D logged, for calibration. D, the decision and the number of calls are
+in the chunk log (divergence, guided, calls); gate_summary.py reads them.
+
     python scripts/eval_openpi.py --suites pos:x0.2 --stride 5 --out runs/openpi_s5 --port 8765
     python scripts/eval_openpi.py --suites pos:x0.2 --signal aac --n-samples 20 --out runs/openpi_aac --port 8765
     python scripts/eval_openpi.py --suites pos:x0.2 --stride 4 --delay 4 --guidance paper --out runs/openpi_rtc --port 8765
+    python scripts/eval_openpi.py --suites pos:y0.2 --stride 5 --delay 4 --guidance paper --rtc-gate divergence --rtc-tau 0.1 ...
 """
 
 from __future__ import annotations
@@ -29,6 +37,8 @@ import math
 import os
 import sys
 import time
+import zlib
+from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -72,6 +82,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--schedule", default="exp", choices=["exp", "linear", "ones", "zeros"], help="--guidance lerobot only")
     p.add_argument("--max-guidance-weight", type=float, default=None, help="beta; default 5 for paper, 10 for lerobot")
     p.add_argument("--mask-end", type=int, default=None, help="RTC soft-mask end; default H - s")
+    p.add_argument("--rtc-gate", choices=["none", "divergence", "random"], default="none", help="guide per request")
+    p.add_argument("--rtc-tau", type=float, default=None, help="divergence: guide if D < tau (0: never)")
+    p.add_argument("--rtc-share", type=float, default=None, help="random: probability to guide")
     p.add_argument("--horizon", type=int, default=HORIZON, help="H the server must return")
     p.add_argument("--resolution", type=int, default=RESOLUTION)
     p.add_argument("--host", default="127.0.0.1")
@@ -97,6 +110,15 @@ def parse_args(argv=None) -> argparse.Namespace:
             p.error(f"need d <= --mask-end <= H - s, got {a.mask_end}, d={a.delay}, s={a.stride}, H={a.horizon}")
     if a.max_guidance_weight is None:
         a.max_guidance_weight = 5.0 if a.guidance == "paper" else 10.0
+    if a.rtc_gate == "none":
+        if a.rtc_tau is not None or a.rtc_share is not None:
+            p.error("--rtc-tau and --rtc-share need --rtc-gate")
+    elif a.guidance == "none":
+        p.error("--rtc-gate needs --guidance")
+    elif a.rtc_gate == "divergence" and (a.rtc_tau is None or a.rtc_tau < 0 or a.rtc_share is not None):
+        p.error("--rtc-gate divergence needs --rtc-tau >= 0 and no --rtc-share")
+    elif a.rtc_gate == "random" and (a.rtc_share is None or not 0 <= a.rtc_share <= 1 or a.rtc_tau is not None):
+        p.error("--rtc-gate random needs --rtc-share in [0, 1] and no --rtc-tau")
     return a
 
 
@@ -193,18 +215,50 @@ def paper_weights(delay: int, mask_end: int, horizon: int, action_dim: int = ACT
     return weights
 
 
+@dataclass(frozen=True)
+class RtcGate:
+    """Whether to guide a request: divergence (D < tau) or random (probability share, seeded by the request's noise)."""
+
+    mode: str
+    overlap: int  # H - s: actions of the old plan the new chunk overlaps
+    tau: float = 0.0
+    share: float = 0.0
+    seed: int = 0
+
+    def divergence(self, plan: np.ndarray, old: np.ndarray) -> float:
+        n = self.overlap
+        return float(np.abs(plan[:n, :ACTION_DIM] - old[:n, :ACTION_DIM]).mean())
+
+    def guide(self, divergence: float, noise: np.ndarray) -> bool:
+        if self.mode == "divergence":
+            return divergence < self.tau
+        # the noise is fixed per (seed, episode, step): the same coin in every run, whatever the state
+        u = np.random.default_rng([self.seed, zlib.crc32(np.ascontiguousarray(noise).tobytes())]).random()
+        return bool(u < self.share)
+
+
 def make_infer(client, prompt: str, horizon: int, n_samples: int = 1, aac: bool = False, rtc_weights=None,
-               max_weight: float = 10.0, jacobian: bool = False):
-    """rtc_weights (paper_weights, make_rtc_weights): guide toward the old plan, which is then kept in model units."""
+               max_weight: float = 10.0, jacobian: bool = False, gate: RtcGate | None = None):
+    """rtc_weights (paper_weights, make_rtc_weights): guide toward the old plan, which is then kept in model units.
+    gate: first the unguided chunk, then guidance only where the gate says so."""
 
     def infer(observations, noise, leftover, delay, mask_end) -> Chunk:
-        rows, plans, signal = [], [], []
+        rows, plans, signal, divergence, guided, calls = [], [], [], [], [], []
         for i, (obs, row) in enumerate(zip(observations, noise)):
             element = make_element(obs, prompt) | {"noise": expand_noise(row[None], n_samples).numpy()}
+            rtc = {}
             if leftover is not None:
-                element |= {"rtc_target": leftover[i].numpy(), "rtc_weights": rtc_weights(delay, int(mask_end[i])),
-                            "rtc_max_weight": max_weight, "rtc_jacobian": jacobian}
-            reply = client.infer(element)
+                rtc = {"rtc_target": leftover[i].numpy(), "rtc_weights": rtc_weights(delay, int(mask_end[i])),
+                       "rtc_max_weight": max_weight, "rtc_jacobian": jacobian}
+            if rtc and gate is not None:
+                free = client.infer(element)
+                d_i = gate.divergence(np.asarray(free["normalized_action"], dtype=np.float32)[0], rtc["rtc_target"])
+                use = gate.guide(d_i, element["noise"])
+                reply = client.infer(element | rtc) if use else free
+                divergence.append(d_i), guided.append(float(use)), calls.append(2.0 if use else 1.0)
+            else:
+                reply = client.infer(element | rtc)
+                divergence.append(-1.0), guided.append(float(bool(rtc))), calls.append(1.0)
             actions = np.asarray(reply["actions"], dtype=np.float32)
             if actions.ndim == 2:  # openpi's stock server
                 actions = actions[None]
@@ -217,7 +271,9 @@ def make_infer(client, prompt: str, horizon: int, n_samples: int = 1, aac: bool 
                 signal.append(paper_h_star(np.asarray(reply["normalized_action"])[..., :ACTION_DIM], actions))
         actions = np.stack(rows)
         model = np.stack(plans) if rtc_weights is not None else actions
-        return Chunk(torch.from_numpy(model.copy()), actions, signal=np.array(signal) if aac else None)
+        extras = {} if gate is None else {"divergence": np.array(divergence), "guided": np.array(guided),
+                                          "calls": np.array(calls)}  # -1: first chunk of the episode, no old plan
+        return Chunk(torch.from_numpy(model.copy()), actions, signal=np.array(signal) if aac else None, extras=extras)
 
     return infer
 
@@ -273,6 +329,8 @@ def progress_key(args) -> dict:
              "max_steps"]
     if args.guidance != "none":  # only with RTC: progress files of runs without it stay valid
         names += ["guidance", "schedule", "max_guidance_weight", "mask_end"]
+    if args.rtc_gate != "none":
+        names += ["rtc_gate", "rtc_tau", "rtc_share"]
     return {k: getattr(args, k) for k in names}
 
 
@@ -314,6 +372,10 @@ def main() -> None:
                        else make_rtc_weights(args.schedule, args.max_guidance_weight, args.horizon))
         log.info("RTC check: zero weights differ by %.4f, frozen actions %.4f from the target",
                  *check_guidance(client, rtc_weights, args.delay, args.horizon, args.max_guidance_weight, jacobian))
+    gate = None
+    if args.rtc_gate != "none":
+        gate = RtcGate(args.rtc_gate, args.horizon - args.stride, args.rtc_tau or 0.0, args.rtc_share or 0.0, args.seed)
+        log.info("RTC gate: %s", gate)
     planner = (AdaptivePlanner(args.horizon, GivenHStar(), s_min=1) if aac
                else FixedPlanner(args.horizon, args.stride, args.mask_end))
     cfg = LoopConfig(args.horizon, args.delay, rtc_weights is not None, args.max_steps, args.seed)
@@ -346,14 +408,15 @@ def main() -> None:
                 continue
             task = suite.get_task(tid)
             infer = make_infer(client, task.language, args.horizon, args.n_samples, aac, rtc_weights,
-                               args.max_guidance_weight, jacobian)
+                               args.max_guidance_weight, jacobian, gate)
             for start in range(0, args.episodes_per_task, args.batch_size):
                 ids = list(range(start, min(start + args.batch_size, args.episodes_per_task)))
                 envs = [LiberoEnv(task_suite=suite, task_id=tid, task_suite_name=name, camera_name=camera_names,
                                   init_states=True, episode_length=args.max_steps, episode_index=i, n_envs=1,
                                   **env_cfg.gym_kwargs) for i in ids]
                 try:
-                    res = run_batch(envs, infer, cfg, planner, [tid * 1000 + i for i in ids], noise_shape)
+                    res = run_batch(envs, infer, cfg, planner, [tid * 1000 + i for i in ids], noise_shape,
+                                    keep_entropy=gate is not None)  # keeps the gate's extras in the chunk log
                 finally:
                     for env in envs:
                         env.close()
