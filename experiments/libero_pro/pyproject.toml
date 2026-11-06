@@ -1,0 +1,26 @@
+[project]
+name = "confidence-budget-libero-pro"
+version = "0.1.0"
+description = "Closed-loop evaluation of chunked execution and RTC on LIBERO / LIBERO-PRO"
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot[pi,libero] @ git+https://github.com/huggingface/lerobot.git@146d8474932c8b566717eb2738ba459337ab71c4",
+    "numpy",
+    "scipy",
+    "matplotlib",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv]
+package = false
+# egl-probe (robomimic) and hf-egl-probe (hf-libero) compile against EGL headers and are only used by
+# LIBERO's training code, not by the simulator; drop them so no compiler or system headers are needed.
+override-dependencies = [
+    "egl-probe; sys_platform == 'never'",
+    "hf-egl-probe; sys_platform == 'never'",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
