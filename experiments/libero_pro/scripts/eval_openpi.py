@@ -22,6 +22,9 @@ exactly naive's. random: guide with probability --rtc-share, independent of the 
 --rtc-tau 0 never guides: naive execution with D logged, for calibration. D, the decision and the number of calls are
 in the chunk log (divergence, guided, calls); gate_summary.py reads them.
 
+--budget CONFIG: the step s per option from openpi_budget.py (naive switching); its features and decisions go to the
+chunk log (budget_x, budget_action, budget_prob, budget_decision), read by openpi_budget_fit.py.
+
     python scripts/eval_openpi.py --suites pos:x0.2 --stride 5 --out runs/openpi_s5 --port 8765
     python scripts/eval_openpi.py --suites pos:x0.2 --signal aac --n-samples 20 --out runs/openpi_aac --port 8765
     python scripts/eval_openpi.py --suites pos:x0.2 --stride 4 --delay 4 --guidance paper --out runs/openpi_rtc --port 8765
@@ -85,6 +88,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--rtc-gate", choices=["none", "divergence", "random"], default="none", help="guide per request")
     p.add_argument("--rtc-tau", type=float, default=None, help="divergence: guide if D < tau (0: never)")
     p.add_argument("--rtc-share", type=float, default=None, help="random: probability to guide")
+    p.add_argument("--budget", type=Path, default=None,
+                   help="JSON config of openpi_budget.py: the step per option, naive switching; no --stride")
     p.add_argument("--horizon", type=int, default=HORIZON, help="H the server must return")
     p.add_argument("--resolution", type=int, default=RESOLUTION)
     p.add_argument("--host", default="127.0.0.1")
@@ -93,7 +98,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out", type=Path, required=True)
     a = p.parse_args(argv)
     # A chunk runs for s + d steps and the next inference must start after the previous switch: d <= s <= H - d.
-    if a.signal == "aac":
+    if a.budget is not None:
+        if a.stride is not None or a.signal is not None or a.n_samples != 1 or a.guidance != "none":
+            p.error("--budget chooses the step itself: no --stride, --signal, --n-samples or --guidance")
+        a.budget_config = json.loads(a.budget.read_text())
+    elif a.signal == "aac":
         if a.stride is not None or a.n_samples < 2:
             p.error("--signal aac takes no --stride and needs --n-samples > 1")
         if 2 * a.delay > a.horizon:
@@ -331,6 +340,8 @@ def progress_key(args) -> dict:
         names += ["guidance", "schedule", "max_guidance_weight", "mask_end"]
     if args.rtc_gate != "none":
         names += ["rtc_gate", "rtc_tau", "rtc_share"]
+    if getattr(args, "budget", None) is not None:
+        names += ["budget_config"]  # its content, not the file name
     return {k: getattr(args, k) for k in names}
 
 
@@ -376,8 +387,17 @@ def main() -> None:
     if args.rtc_gate != "none":
         gate = RtcGate(args.rtc_gate, args.horizon - args.stride, args.rtc_tau or 0.0, args.rtc_share or 0.0, args.seed)
         log.info("RTC gate: %s", gate)
-    planner = (AdaptivePlanner(args.horizon, GivenHStar(), s_min=1) if aac
-               else FixedPlanner(args.horizon, args.stride, args.mask_end))
+    runtime = None
+    if args.budget is not None:
+        from openpi_budget import BudgetRuntime, GivenStride, make_budget_infer
+
+        runtime = BudgetRuntime(args.budget_config, args.seed, args.horizon, args.delay)
+        log.info("budget: %s", args.budget_config)
+        planner = GivenStride(args.horizon)
+    elif aac:
+        planner = AdaptivePlanner(args.horizon, GivenHStar(), s_min=1)
+    else:
+        planner = FixedPlanner(args.horizon, args.stride, args.mask_end)
     cfg = LoopConfig(args.horizon, args.delay, rtc_weights is not None, args.max_steps, args.seed)
     env_cfg = LiberoEnvConfig(task=suites[0], episode_length=args.max_steps, observation_height=args.resolution,
                               observation_width=args.resolution)
@@ -407,8 +427,11 @@ def main() -> None:
             if tid in finished:
                 continue
             task = suite.get_task(tid)
-            infer = make_infer(client, task.language, args.horizon, args.n_samples, aac, rtc_weights,
-                               args.max_guidance_weight, jacobian, gate)
+            if runtime is not None:
+                infer = make_budget_infer(client, task.language, args.horizon, runtime, make_element)
+            else:
+                infer = make_infer(client, task.language, args.horizon, args.n_samples, aac, rtc_weights,
+                                   args.max_guidance_weight, jacobian, gate)
             for start in range(0, args.episodes_per_task, args.batch_size):
                 ids = list(range(start, min(start + args.batch_size, args.episodes_per_task)))
                 envs = [LiberoEnv(task_suite=suite, task_id=tid, task_suite_name=name, camera_name=camera_names,
@@ -416,7 +439,7 @@ def main() -> None:
                                   **env_cfg.gym_kwargs) for i in ids]
                 try:
                     res = run_batch(envs, infer, cfg, planner, [tid * 1000 + i for i in ids], noise_shape,
-                                    keep_entropy=gate is not None)  # keeps the gate's extras in the chunk log
+                                    keep_entropy=gate is not None or runtime is not None)  # extras -> chunk log
                 finally:
                     for env in envs:
                         env.close()

@@ -61,7 +61,7 @@ class Chunk:
 
 
 # infer(observations, noise (B,H,A_max), leftover (B,H,A) zero-padded | None, delay, mask_end (B,) | None
-#       [, leftover_disp=..., leftover_len=...]) -> Chunk
+#       [, leftover_disp=..., leftover_len=...] [, episodes=..., step=... if infer.wants_context]) -> Chunk
 Infer = Callable[..., Chunk]
 
 
@@ -136,6 +136,8 @@ def run_batch(
                 disp[i, : rest.shape[0]] = torch.as_tensor(rest, dtype=torch.float32)
             extra = {"leftover_disp": disp,
                      "leftover_len": torch.as_tensor([horizon - (t - active_start[b]) for b in due])}
+        if getattr(infer, "wants_context", False):  # e.g. a per-episode controller: which episodes, at which step
+            extra |= {"episodes": [episode_ids[b] for b in due], "step": t}
         noise = chunk_noise(cfg.seed, [episode_ids[b] for b in due], t, noise_shape)
         chunk = infer([observations[b] for b in due], noise, leftover, 0 if first else d, mask, **extra)
         for i, b in enumerate(due):
