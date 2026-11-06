@@ -173,6 +173,20 @@ def explore_rows(seed, n_tasks=6, n_init=10):
     return rows
 
 
+def one_decision_rows(seed, n_tasks=6, n_init=10):
+    """One option per episode, and it decides the episode: s = 2 when feature 0 is positive, s = 8 otherwise.
+    (With several options and random features the network cannot tell which decision mattered.)"""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for task in range(n_tasks):
+        for init in range(n_init):
+            x = rng.standard_normal(FEATURE_DIM).astype(np.float32)
+            a = int(rng.integers(4))
+            good = (a == 0) if x[0] > 0 else (a == 3)
+            rows.append((task, init, rng.random() < (0.95 if good else 0.05), [(0, GRID[a], a, 0.25, 1, x)]))
+    return rows
+
+
 def test_load_decisions(tmp_path):
     run = write_run(tmp_path / "r", explore_rows(0, 2, 3))
     data = load_decisions([run])
@@ -185,12 +199,12 @@ def test_load_decisions(tmp_path):
 
 
 def test_fit_finds_a_state_dependent_step_and_the_policy_deploys(tmp_path):
-    runs = [write_run(tmp_path / f"e{k}", explore_rows(k)) for k in range(10)]
+    runs = [write_run(tmp_path / f"e{k}", one_decision_rows(k)) for k in range(10)]
     out = tmp_path / "fit"
     rule_rate = (1 / 2 + 1 / 8) / 2  # the data's rule, half s = 2, half s = 8
     main(["fit", *map(str, runs), "--out", str(out), "--option-ticks", "12", "--target-rate", str(rule_rate)])
     summary = json.loads((out / "fit.json").read_text())
-    assert summary["main"]["uplift"][0] > 0 and (out / "fit.md").exists() and summary["decisions"] == 10 * 60 * 3
+    assert summary["main"]["uplift"][1] > 0 and (out / "fit.md").exists() and summary["decisions"] == 10 * 60
     runtime = BudgetRuntime(config("policy", policy=str(out / "policy.pt")), 0, H, 2)
     x = np.zeros(FEATURE_DIM, np.float32)
     x[0] = 3.0
