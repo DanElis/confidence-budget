@@ -20,10 +20,11 @@
 #   test:  PRIMARY for each r: learned at the rate of constant r against constant r (rate within 5%), paired Δ of
 #          success over x0.1-x0.3, CI above zero at 1 - 0.05 / (number of r) (Bonferroni). Secondary: against
 #          marginal at r; against s*: a budget that spends more calls is of use only if it also beats s*.
-# A stop writes runs/openpi_budget_d2/stopped.txt; FORCE=1 continues for inspection only.
+# A stop writes runs/openpi_budget_d2/stopped.txt; FORCE=1 continues (then the gates are reported, not applied).
+# The run of 07.11.2026 uses FORCE=1 at the user's decision: the budget goes to test whatever the offline gates say.
 #
 # Usage (from experiments/libero_pro, after setup_openpi.sh):
-#   tmux new -d -s budget "REF_STRIDES='6 5' bash scripts/stages/openpi_budget.sh"
+#   tmux new -d -s budget "REF_STRIDES='6 5' FORCE=1 bash scripts/stages/openpi_budget.sh"
 # EPISODES_PER_TASK=20 GRID="2 4 6 8" OPTION_TICKS=40 EXPLORE_SEEDS="101 102" PORT=8820 JOBS=6 by default; re-running
 # skips finished suites and keeps a finished fit.
 JOBS=${JOBS:-6}   # two clients per server: the simulator and the server take turns
