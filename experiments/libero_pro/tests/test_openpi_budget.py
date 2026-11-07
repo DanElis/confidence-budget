@@ -20,7 +20,7 @@ from openpi_budget import (  # noqa: E402
     gripper_flip,
     make_budget_infer,
 )
-from openpi_budget_fit import calibrate, headroom, load_decisions, main, run_rate  # noqa: E402
+from openpi_budget_fit import calibrate, headroom, load_decisions, main, report, retarget, run_rate  # noqa: E402
 
 H, GRID = 10, (2, 4, 6, 8)
 
@@ -220,6 +220,34 @@ def test_calibrate_moves_the_rate(tmp_path):
     assert calibrate(runs[0], policy, run_rate(runs[0]), tmp_path / "same.pt") == policy  # matched: kept
     out = calibrate(runs[0], policy, 2 * run_rate(runs[0]), tmp_path / "recal.pt")
     assert out == tmp_path / "recal.pt" and out.exists()
+
+
+def test_retarget_moves_the_rate_of_the_same_q(tmp_path):
+    from fit_budget import request_rate
+    from openpi_budget import load_qpolicy
+
+    runs = [write_run(tmp_path / f"e{k}", explore_rows(k)) for k in range(3)]
+    main(["fit", *map(str, runs), "--out", str(tmp_path / "fit"), "--option-ticks", "12", "--target-rate", "0.25"])
+    data = load_decisions(runs)
+    rates = []
+    for target in (0.15, 0.4):
+        path = retarget(runs, tmp_path / "fit" / "policy.pt", target, tmp_path / f"p{target}.pt")
+        policy = load_qpolicy(path)
+        rates.append(request_rate(policy.greedy(data["x"]), policy.pairs))
+    assert rates[0] < rates[1] and rates[0] == pytest.approx(0.15, abs=0.05)
+
+
+def test_report_rows_and_level(tmp_path):
+    def run(name, success, inferences):
+        rows = [(0, i, s, [(0, 4, 1, 1.0, 1, np.zeros(FEATURE_DIM))] * inferences) for i, s in enumerate(success)]
+        return write_run(tmp_path / name, rows)
+
+    fixed, learned, control = run("f", [0, 0, 1, 1], 2), run("l", [1, 1, 1, 1], 2), run("m", [0, 1, 1, 1], 2)
+    best = run("b", [1, 0, 1, 1], 1)
+    text = report(fixed, learned, control, best=best, level=0.975)
+    assert "97.5% CI" in text and "PRIMARY learned - fixed at its rate | +50.0" in text
+    assert "best constant (fewer calls) | +25.0" in text and "| 2.000 | False |" in text  # twice the calls of best
+    assert "fewer calls" not in report(fixed, learned, control, best=fixed)
 
 
 def test_headroom_cross_fits_the_per_scene_step(tmp_path):

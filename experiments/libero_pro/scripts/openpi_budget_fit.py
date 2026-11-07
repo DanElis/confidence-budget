@@ -26,7 +26,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT.parent / "libero_dynamic"))
-from compare import all_suites, build_table, episode_table, load_run, paired_diff  # noqa: E402
+from compare import all_suites, build_table, episode_table, load_run  # noqa: E402
 from openpi_budget import FEATURE_DIM, FEATURES, GRID, load_qpolicy, write_config  # noqa: E402
 
 HEADROOM_MIN = 0.02  # cross-fitted per-scene best s over the best constant: below 2 pp no budget is trained
@@ -245,6 +245,16 @@ def calibrate(run: Path, policy_path: Path, target: float, out: Path) -> Path:
     return out
 
 
+def retarget(runs, policy_path: Path, target: float, out: Path) -> Path:
+    """The same Q with the multiplier for another target rate (in options, 1/s), on the states of the given runs."""
+    from fit_budget import cost_for_rate
+
+    policy = load_qpolicy(policy_path)
+    data = load_decisions(runs, [s for s, _ in policy.pairs])
+    policy.save(out, cost_for_rate(policy.q(data["x"]), policy.pairs, policy.calls, target))
+    return out
+
+
 def marginal(run: Path, grid) -> list:
     data = load_decisions([run], grid)
     freq = np.bincount(data["action"], minlength=len(grid)) / len(data["action"])
@@ -253,19 +263,34 @@ def marginal(run: Path, grid) -> list:
 
 # ---------------------------------------------------------------- report
 
-def report(fixed: Path, learned: Path, control: Path, headroom_json: Path | None = None) -> str:
-    f, le, m = episodes(fixed), episodes(learned), episodes(control)
-    lines = ["# Step budget on openpi: test", "", build_table([fixed, learned, control], fixed), "",
-             "| comparison | Δ success, pp [95% CI] | pairs | rate ratio | equal rate (within 5%) |",
+def paired(ref_dir: Path, other_dir: Path, level: float, n_boot: int = 2000, seed: int = 0):
+    """Paired Δ of success (other - ref) by (suite, task, init state) -> (mean, low, high, pairs) at the CI level."""
+    ref, other = episodes(ref_dir), episodes(other_dir)
+    keys = sorted(set(ref) & set(other))
+    d = np.array([float(other[k]["success"]) - float(ref[k]["success"]) for k in keys])
+    boots = d[np.random.default_rng(seed).integers(0, len(d), size=(n_boot, len(d)))].mean(1)
+    tail = (1 - level) / 2
+    return float(d.mean()), float(np.quantile(boots, tail)), float(np.quantile(boots, 1 - tail)), len(keys)
+
+
+def report(fixed: Path, learned: Path, control: Path, headroom_json: Path | None = None, best: Path | None = None,
+           level: float = 0.95) -> str:
+    runs = [fixed, learned, control] + ([best] if best is not None and best != fixed else [])
+    pct = f"{100 * level:g}%"
+    lines = ["# Step budget on openpi: test", "", build_table(runs, fixed), "",
+             f"| comparison | Δ success, pp [{pct} CI] | pairs | rate ratio | equal rate (within 5%) |",
              "|---|---:|---:|---:|---|"]
-    for label, ref, other, ref_dir, other_dir in (("PRIMARY learned - fixed s*", f, le, fixed, learned),
-                                                  ("learned - marginal", m, le, control, learned)):
-        d, lo, hi, n = paired_diff(ref, other, 2000, 0)
+    rows = [("PRIMARY learned - fixed at its rate", fixed, learned), ("learned - marginal", control, learned)]
+    if best is not None and best != fixed:
+        rows.append(("learned - best constant (fewer calls)", best, learned))
+    for label, ref_dir, other_dir in rows:
+        d, lo, hi, n = paired(ref_dir, other_dir, level)
         ratio = run_rate(other_dir) / run_rate(ref_dir)
         lines.append(f"| {label} | {100 * d:+.1f} [{100 * lo:+.1f}; {100 * hi:+.1f}] | {n} | {ratio:.3f} | "
                      f"{abs(ratio - 1) <= EQUAL_RATE} |")
-    lines += ["", "Fixed before the run: a gain counts only if the primary CI is above zero at equal rate; the other "
-              "row is secondary. The CI bootstraps episodes; episodes of one scene are not independent."]
+    lines += ["", f"Fixed before the run: a gain counts only if the primary {pct} CI is above zero at equal rate; the "
+              "other rows are secondary. A budget that spends more calls is useful only if it also beats the best "
+              "constant. The CI bootstraps episodes; episodes of one scene are not independent."]
     if headroom_json is not None:
         h = json.loads(Path(headroom_json).read_text())
         lines += ["", f"Headroom on the tuning levels: {100 * h['gain']:+.2f} pp, s* = {h['s_star']}."]
@@ -294,6 +319,11 @@ def main(argv=None) -> None:
     c.add_argument("--policy", type=Path, required=True)
     c.add_argument("--target-rate", type=float, required=True)
     c.add_argument("--out", type=Path, required=True)
+    rt = sub.add_parser("retarget")
+    rt.add_argument("runs", type=Path, nargs="+")
+    rt.add_argument("--policy", type=Path, required=True)
+    rt.add_argument("--target-rate", type=float, required=True)
+    rt.add_argument("--out", type=Path, required=True)
     m = sub.add_parser("marginal")
     m.add_argument("run", type=Path)
     m.add_argument("--grid", type=int, nargs="+", default=list(GRID))
@@ -313,6 +343,8 @@ def main(argv=None) -> None:
     t.add_argument("--learned", type=Path, required=True)
     t.add_argument("--marginal", type=Path, required=True)
     t.add_argument("--headroom", type=Path, default=None)
+    t.add_argument("--best", type=Path, default=None, help="the best constant step: a secondary row")
+    t.add_argument("--level", type=float, default=0.95, help="CI level (Bonferroni over reference steps)")
     t.add_argument("--out", type=Path, required=True)
     a = p.parse_args(argv)
 
@@ -332,6 +364,8 @@ def main(argv=None) -> None:
         print(int(summary["pass"]))
     elif a.cmd == "calibrate":
         print(calibrate(a.run, a.policy, a.target_rate, a.out))
+    elif a.cmd == "retarget":
+        print(retarget(a.runs, a.policy, a.target_rate, a.out))
     elif a.cmd == "marginal":
         print(json.dumps(marginal(a.run, tuple(a.grid))))
     elif a.cmd == "rate":
@@ -346,7 +380,7 @@ def main(argv=None) -> None:
             config["policy"] = str(Path(a.policy).resolve())
         write_config(a.out, **config)
     elif a.cmd == "report":
-        a.out.write_text(report(a.fixed, a.learned, a.marginal, a.headroom))
+        a.out.write_text(report(a.fixed, a.learned, a.marginal, a.headroom, a.best, a.level))
 
 
 if __name__ == "__main__":
