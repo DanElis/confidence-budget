@@ -75,6 +75,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--libero-pro-root", type=Path, default=ROOT / "third_party" / "LIBERO-PRO")
     p.add_argument("--task-ids", type=int, nargs="*", default=None)
     p.add_argument("--episodes-per-task", type=int, default=50)
+    p.add_argument("--first-episode", type=int, default=0,
+                   help="first init state: episodes first .. first + episodes-per-task - 1 (new scenes of a task)")
     p.add_argument("--batch-size", type=int, default=10)
     p.add_argument("--max-steps", type=int, default=MAX_STEPS)
     p.add_argument("--stride", type=int, default=None, help="constant step; with --signal aac leave it out")
@@ -342,6 +344,8 @@ def progress_key(args) -> dict:
         names += ["rtc_gate", "rtc_tau", "rtc_share"]
     if getattr(args, "budget", None) is not None:
         names += ["budget_config"]  # its content, not the file name
+    if getattr(args, "first_episode", 0):
+        names += ["first_episode"]  # only when set: progress files of earlier runs stay valid
     return {k: getattr(args, k) for k in names}
 
 
@@ -432,8 +436,9 @@ def main() -> None:
             else:
                 infer = make_infer(client, task.language, args.horizon, args.n_samples, aac, rtc_weights,
                                    args.max_guidance_weight, jacobian, gate)
-            for start in range(0, args.episodes_per_task, args.batch_size):
-                ids = list(range(start, min(start + args.batch_size, args.episodes_per_task)))
+            last = args.first_episode + args.episodes_per_task
+            for start in range(args.first_episode, last, args.batch_size):
+                ids = list(range(start, min(start + args.batch_size, last)))
                 envs = [LiberoEnv(task_suite=suite, task_id=tid, task_suite_name=name, camera_name=camera_names,
                                   init_states=True, episode_length=args.max_steps, episode_index=i, n_envs=1,
                                   **env_cfg.gym_kwargs) for i in ids]

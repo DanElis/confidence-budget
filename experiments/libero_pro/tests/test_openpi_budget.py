@@ -127,6 +127,8 @@ def test_args_and_progress_key(tmp_path):
     a = parse_args(base + ["--budget", str(path)])
     assert a.stride is None and progress_key(a)["budget_config"] == config()
     assert "budget_config" not in progress_key(parse_args(base + ["--stride", "4"]))
+    assert "first_episode" not in progress_key(a)  # the default keeps earlier progress files valid
+    assert progress_key(parse_args(base + ["--stride", "4", "--first-episode", "20"]))["first_episode"] == 20
     for bad in (["--stride", "4"], ["--guidance", "paper"]):
         with pytest.raises(SystemExit):
             parse_args(base + ["--budget", str(path)] + bad)
