@@ -27,7 +27,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT.parent / "libero_dynamic"))
 from compare import all_suites, build_table, episode_table, load_run  # noqa: E402
-from openpi_budget import FEATURE_DIM, FEATURES, GRID, load_qpolicy, write_config  # noqa: E402
+from openpi_budget import (  # noqa: E402
+    FEATURE_DIM,
+    FEATURES,
+    GRID,
+    NAIVE,
+    load_qpolicy,
+    normalize_pairs,
+    parse_pair,
+    write_config,
+)
 
 HEADROOM_MIN = 0.02  # cross-fitted per-scene best s over the best constant: below 2 pp no budget is trained
 AUROC_MIN = 0.65
@@ -51,9 +60,24 @@ def rate_matched(rate: float, target: float) -> bool:
     return abs(rate / target - 1) <= EQUAL_RATE
 
 
-def load_decisions(runs, grid=GRID, behaviour=True) -> dict:
-    """Option decisions of budget runs, in episode / step order. behaviour: the runs must log grid actions
+def as_pairs(grid=None) -> list:
+    """None -> the naive grid; a list of s, of 's:r' or of (s, r) -> [(s, r)]."""
+    if grid is None:
+        grid = GRID
+    pairs = [parse_pair(p) for p in grid]
+    return normalize_pairs(pairs) if all(isinstance(p, (list, tuple)) for p in grid) else pairs
+
+
+def pair_label(pair) -> str:
+    s, r = pair
+    return f"s={s} naive" if r == NAIVE else f"s={s} r={r}"
+
+
+def load_decisions(runs, grid=None, behaviour=True) -> dict:
+    """Option decisions of budget runs, in episode / step order. The action is the index of (s, r) in the pairs; runs
+    of the naive budget log no r: r = naive, so they pool with RTC runs. behaviour: the runs must log pairs of the grid
     with propensities (explore / marginal / policy), as the Q fit needs."""
+    pairs = as_pairs(grid)
     cols = defaultdict(list)
     n_episode = 0
     for run in runs:
@@ -72,10 +96,11 @@ def load_decisions(runs, grid=GRID, behaviour=True) -> dict:
                 for c in rows:
                     if not c["budget_decision"]:
                         continue
-                    if behaviour and (c["budget_action"] < 0 or grid[int(c["budget_action"])] != c["stride"]):
-                        raise RuntimeError(f"{run}/{suite}: a decision off the grid {grid}")
+                    key = (int(c["stride"]), int(c.get("budget_r", NAIVE)))
+                    if behaviour and (c["budget_action"] < 0 or key not in pairs):
+                        raise RuntimeError(f"{run}/{suite}: a decision {key} off the grid {pairs}")
                     cols["x"].append(np.asarray(c["budget_x"], np.float32))
-                    cols["action"].append(int(c["budget_action"]))
+                    cols["action"].append(pairs.index(key) if key in pairs else -1)
                     cols["prob"].append(float(c["budget_prob"]))
                     cols["step"].append(int(c["step"]))
                     cols["episode"].append(n_episode)
@@ -178,12 +203,13 @@ def evaluate(data, advantage, pairs, fold, calls, target, seed):
 
 
 def fit(data, grid, option_ticks, target, out: Path, lam=0.5, folds=5, seed=0) -> dict:
+    """grid: the pairs (s, r) of the data's actions (as_pairs); r = -1 is naive."""
     import torch
     from fit_budget import fit_value, fold_ids, group_bootstrap, lambda_targets, option_calls
 
     out.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(4)
-    pairs = [(int(s), 0) for s in grid]
+    pairs = as_pairs(grid)
     calls = option_calls(pairs, option_ticks)
     fold = fold_ids(data["group"], folds, seed)
     value = fit_value(data, fold, seed)
@@ -192,12 +218,12 @@ def fit(data, grid, option_ticks, target, out: Path, lam=0.5, folds=5, seed=0) -
     main = evaluate(data, advantage, pairs, fold, calls, target, seed)
     torch.save(main.pop("ckpt"), out / "policy.pt")
     monte_carlo = evaluate(data, data["success"] - value, pairs, fold, calls, target, seed)["uplift"]
-    by_s = [(s, int((data["action"] == a).sum()), *group_bootstrap(advantage[data["action"] == a],
-                                                                    data["group"][data["action"] == a], seed=seed))
-            for a, s in enumerate(grid) if (data["action"] == a).any()]
+    by_s = [(pair_label(p), int((data["action"] == a).sum()),
+             *group_bootstrap(advantage[data["action"] == a], data["group"][data["action"] == a], seed=seed))
+            for a, p in enumerate(pairs) if (data["action"] == a).any()]
     gates = {"value_auroc": bool(middle >= AUROC_MIN), "state_dependence": bool(main["uplift"][1] > 0)}
     summary = {"pass": all(gates.values()), "gates": gates, "value_auroc_middle": middle, "value_bins": bins,
-               "main": main, "monte_carlo_uplift": monte_carlo, "by_s": by_s, "grid": list(grid),
+               "main": main, "monte_carlo_uplift": monte_carlo, "by_s": by_s, "grid": [pair_label(p) for p in pairs],
                "decisions": len(data["step"]), "episodes": int(data["episode"].max() + 1),
                "items": len(np.unique(data["group"])), "target_rate": target, "lambda": lam}
     (out / "fit.json").write_text(json.dumps(summary, indent=1))
@@ -222,10 +248,10 @@ def fit_markdown(s: dict) -> str:
              f"[{m['mse_gain'][1]:+.6f}; {m['mse_gain'][2]:+.6f}].",
              f"Same uplift with Monte Carlo targets: {s['monte_carlo_uplift']}.",
              f"Greedy rate on logged states {m['rate']:.4f} (target {s['target_rate']:.4f}); frequencies: "
-             + ", ".join(f"s={g}: {100 * f:.1f}%" for g, f in zip(s["grid"], m["marginal"])), "",
+             + ", ".join(f"{g}: {100 * f:.1f}%" for g, f in zip(s["grid"], m["marginal"])), "",
              "## V by episode time", "", "| steps | decisions | AUROC |", "|---|---:|---:|",
              *[f"| {a}..{b} | {n} | {v:.3f} |" for a, b, n, v in s["value_bins"]], "",
-             "## Advantage by s (descriptive)", "", "| s | decisions | mean [95% CI] |", "|---:|---:|---:|",
+             "## Advantage by action (descriptive)", "", "| action | decisions | mean [95% CI] |", "|---|---:|---:|",
              *[f"| {g} | {n} | {v:+.5f} [{lo:+.5f}; {hi:+.5f}] |" for g, n, v, lo, hi in s["by_s"]]]
     return "\n".join(lines) + "\n"
 
@@ -238,7 +264,7 @@ def calibrate(run: Path, policy_path: Path, target: float, out: Path) -> Path:
     if rate_matched(realized, target):
         return policy_path
     policy = load_qpolicy(policy_path)
-    data = load_decisions([run], [s for s, _ in policy.pairs])
+    data = load_decisions([run], policy.pairs)
     q = policy.q(data["x"])
     proxy = request_rate((q - policy.cost * policy.calls).argmax(1), policy.pairs)  # what the multiplier controls
     policy.save(out, cost_for_rate(q, policy.pairs, policy.calls, proxy * target / realized))
@@ -250,15 +276,58 @@ def retarget(runs, policy_path: Path, target: float, out: Path) -> Path:
     from fit_budget import cost_for_rate
 
     policy = load_qpolicy(policy_path)
-    data = load_decisions(runs, [s for s, _ in policy.pairs])
+    data = load_decisions(runs, policy.pairs, behaviour=False)  # naive runs pooled into an RTC fit: off-grid -> -1
     policy.save(out, cost_for_rate(policy.q(data["x"]), policy.pairs, policy.calls, target))
     return out
 
 
 def marginal(run: Path, grid) -> list:
-    data = load_decisions([run], grid)
-    freq = np.bincount(data["action"], minlength=len(grid)) / len(data["action"])
+    pairs = as_pairs(grid)
+    data = load_decisions([run], pairs)
+    freq = np.bincount(data["action"], minlength=len(pairs)) / len(data["action"])
     return [float(f) for f in freq]
+
+
+# ---------------------------------------------------------------- constant pairs
+
+def run_pair(run: Path, delay: int) -> tuple[int, int]:
+    """(s, r) of a constant run of eval_openpi.py from its config.json: r = mask_end - d with RTC, naive otherwise."""
+    c = json.loads((Path(run) / "config.json").read_text())
+    s = int(c["stride"])
+    if c.get("guidance", "none") == "none":
+        return s, NAIVE
+    end = int(c["horizon"]) - s if c.get("mask_end") in (None, "None") else int(c["mask_end"])
+    return s, end - delay
+
+
+def constants(runs, delay: int, level: float) -> dict:
+    """Constant runs on the same scenes and noise: each RTC pair against naive with the same s; the best constant pair
+    per s (ties go to naive)."""
+    by_pair = {run_pair(run, delay): Path(run) for run in runs}
+    rows, best = [], {}
+    for s in sorted({s for s, _ in by_pair}):
+        naive = by_pair.get((s, NAIVE))
+        mine = {p: d for p, d in by_pair.items() if p[0] == s}
+        success = {p: float(np.mean([e["success"] for e in episodes(d).values()])) for p, d in mine.items()}
+        choice = max(sorted(mine, key=lambda p: (p[1] != NAIVE, p[1])), key=lambda p: success[p])
+        best[str(s)] = {"s": s, "r": choice[1], "run": str(mine[choice]), "success": success[choice]}
+        for p in sorted(mine):
+            delta = paired(naive, mine[p], level) if naive is not None and p[1] != NAIVE else None
+            rows.append((p, success[p], delta, run_rate(mine[p])))
+    return {"rows": rows, "best": best, "level": level}
+
+
+def constants_markdown(c: dict) -> str:
+    pct = f"{100 * c['level']:g}%"
+    lines = ["# Constant RTC against naive, same s, same scenes and noise", "",
+             f"| pair | success, % | Δ to naive same s, pp [{pct} CI] | pairs | requests / step |", "|---|---:|---:|---:|---:|"]
+    for p, success, delta, rate in c["rows"]:
+        d = "—" if delta is None else f"{100 * delta[0]:+.1f} [{100 * delta[1]:+.1f}; {100 * delta[2]:+.1f}]"
+        n = "" if delta is None else str(delta[3])
+        lines.append(f"| {pair_label(p)} | {100 * success:.1f} | {d} | {n} | {rate:.4f} |")
+    lines += ["", "Best constant pair per s (ties go to naive): "
+              + ", ".join(f"s={k}: {pair_label((v['s'], v['r']))} ({100 * v['success']:.1f}%)" for k, v in c["best"].items())]
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------- report
@@ -274,8 +343,10 @@ def paired(ref_dir: Path, other_dir: Path, level: float, n_boot: int = 2000, see
 
 
 def report(fixed: Path, learned: Path, control: Path, headroom_json: Path | None = None, best: Path | None = None,
-           level: float = 0.95) -> str:
-    runs = [fixed, learned, control] + ([best] if best is not None and best != fixed else [])
+           level: float = 0.95, prior: Path | None = None) -> str:
+    """prior: the learned budget of s alone (naive) on the same episodes: does the RTC window add to the choice of s?"""
+    runs = [fixed, learned, control] + ([best] if best is not None and best != fixed else []) + \
+        ([prior] if prior is not None else [])
     pct = f"{100 * level:g}%"
     lines = ["# Step budget on openpi: test", "", build_table(runs, fixed), "",
              f"| comparison | Δ success, pp [{pct} CI] | pairs | rate ratio | equal rate (within 5%) |",
@@ -283,6 +354,8 @@ def report(fixed: Path, learned: Path, control: Path, headroom_json: Path | None
     rows = [("PRIMARY learned - fixed at its rate", fixed, learned), ("learned - marginal", control, learned)]
     if best is not None and best != fixed:
         rows.append(("learned - best constant (fewer calls)", best, learned))
+    if prior is not None:
+        rows.append(("learned - learned s only (naive)", prior, learned))
     for label, ref_dir, other_dir in rows:
         d, lo, hi, n = paired(ref_dir, other_dir, level)
         ratio = run_rate(other_dir) / run_rate(ref_dir)
@@ -308,7 +381,7 @@ def main(argv=None) -> None:
     f = sub.add_parser("fit")
     f.add_argument("runs", type=Path, nargs="+")
     f.add_argument("--out", type=Path, required=True)
-    f.add_argument("--grid", type=int, nargs="+", default=list(GRID))
+    f.add_argument("--grid", nargs="+", default=list(GRID), help="s (naive) or s:r (r = -1 naive)")
     f.add_argument("--option-ticks", type=int, required=True)
     f.add_argument("--target-rate", type=float, required=True)
     f.add_argument("--folds", type=int, default=5)
@@ -326,16 +399,21 @@ def main(argv=None) -> None:
     rt.add_argument("--out", type=Path, required=True)
     m = sub.add_parser("marginal")
     m.add_argument("run", type=Path)
-    m.add_argument("--grid", type=int, nargs="+", default=list(GRID))
+    m.add_argument("--grid", nargs="+", default=list(GRID))
     r = sub.add_parser("rate")
     r.add_argument("run", type=Path)
+    k = sub.add_parser("constants")
+    k.add_argument("runs", type=Path, nargs="+", help="constant runs, naive and RTC, on the same scenes and noise")
+    k.add_argument("--delay", type=int, required=True)
+    k.add_argument("--level", type=float, default=0.95)
+    k.add_argument("--out", type=Path, required=True, help="directory for constants.md and constants.json")
     g = sub.add_parser("config")
     g.add_argument("--out", type=Path, required=True)
     g.add_argument("--mode", required=True)
-    g.add_argument("--grid", type=int, nargs="+", default=list(GRID))
+    g.add_argument("--grid", nargs="+", default=list(GRID), help="s (naive) or s:r; any s:r writes pairs")
     g.add_argument("--option-ticks", type=int, required=True)
     g.add_argument("--max-steps", type=int, required=True)
-    g.add_argument("--fixed", type=int, default=None)
+    g.add_argument("--fixed", default=None, help="s or s:r")
     g.add_argument("--marginal", default=None, help="JSON list")
     g.add_argument("--policy", default=None)
     t = sub.add_parser("report")
@@ -345,6 +423,7 @@ def main(argv=None) -> None:
     t.add_argument("--headroom", type=Path, default=None)
     t.add_argument("--best", type=Path, default=None, help="the best constant step: a secondary row")
     t.add_argument("--level", type=float, default=0.95, help="CI level (Bonferroni over reference steps)")
+    t.add_argument("--prior", type=Path, default=None, help="the learned budget of s alone: a secondary row")
     t.add_argument("--out", type=Path, required=True)
     a = p.parse_args(argv)
 
@@ -359,7 +438,7 @@ def main(argv=None) -> None:
         if (a.out / "fit.json").exists() and (a.out / "policy.pt").exists():  # rollouts may already use this policy
             summary = json.loads((a.out / "fit.json").read_text())
         else:
-            summary = fit(load_decisions(a.runs, tuple(a.grid)), a.grid, a.option_ticks, a.target_rate, a.out, a.lam,
+            summary = fit(load_decisions(a.runs, a.grid), a.grid, a.option_ticks, a.target_rate, a.out, a.lam,
                           a.folds, a.seed)
         print(int(summary["pass"]))
     elif a.cmd == "calibrate":
@@ -367,20 +446,31 @@ def main(argv=None) -> None:
     elif a.cmd == "retarget":
         print(retarget(a.runs, a.policy, a.target_rate, a.out))
     elif a.cmd == "marginal":
-        print(json.dumps(marginal(a.run, tuple(a.grid))))
+        print(json.dumps(marginal(a.run, a.grid)))
     elif a.cmd == "rate":
         print(f"{run_rate(a.run):.6f}")
+    elif a.cmd == "constants":
+        result = constants(a.runs, a.delay, a.level)
+        a.out.mkdir(parents=True, exist_ok=True)
+        (a.out / "constants.json").write_text(json.dumps({k: v for k, v in result.items() if k != "rows"}, indent=1))
+        (a.out / "constants.md").write_text(constants_markdown(result))
     elif a.cmd == "config":
-        config = {"mode": a.mode, "grid": a.grid, "option_ticks": a.option_ticks, "max_steps": a.max_steps}
+        pairs = as_pairs(a.grid)
+        config = {"mode": a.mode, "option_ticks": a.option_ticks, "max_steps": a.max_steps}
+        if all(r == NAIVE for _, r in pairs):
+            config["grid"] = [s for s, _ in pairs]  # the naive budget: configs of 07.11.2026 stay the same
+        else:
+            config["pairs"] = [list(p) for p in pairs]
         if a.fixed is not None:
-            config["fixed"] = a.fixed
+            s, r = parse_pair(a.fixed)
+            config["fixed"] = s if r == NAIVE else [s, r]
         if a.marginal is not None:
             config["marginal"] = json.loads(a.marginal)
         if a.policy is not None:
             config["policy"] = str(Path(a.policy).resolve())
         write_config(a.out, **config)
     elif a.cmd == "report":
-        a.out.write_text(report(a.fixed, a.learned, a.marginal, a.headroom, a.best, a.level))
+        a.out.write_text(report(a.fixed, a.learned, a.marginal, a.headroom, a.best, a.level, a.prior))
 
 
 if __name__ == "__main__":

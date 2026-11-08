@@ -398,11 +398,16 @@ def main() -> None:
         runtime = BudgetRuntime(args.budget_config, args.seed, args.horizon, args.delay)
         log.info("budget: %s", args.budget_config)
         planner = GivenStride(args.horizon)
+        if runtime.uses_rtc:  # RTC of the paper on the pairs with r >= 0
+            log.info("RTC check: zero weights differ by %.4f, frozen actions %.4f from the target",
+                     *check_guidance(client, lambda delay, end: paper_weights(delay, end, args.horizon), args.delay,
+                                     args.horizon, 5.0, True))
     elif aac:
         planner = AdaptivePlanner(args.horizon, GivenHStar(), s_min=1)
     else:
         planner = FixedPlanner(args.horizon, args.stride, args.mask_end)
-    cfg = LoopConfig(args.horizon, args.delay, rtc_weights is not None, args.max_steps, args.seed)
+    guided = rtc_weights is not None or (runtime is not None and runtime.uses_rtc)  # the loop passes the old plan
+    cfg = LoopConfig(args.horizon, args.delay, guided, args.max_steps, args.seed)
     env_cfg = LiberoEnvConfig(task=suites[0], episode_length=args.max_steps, observation_height=args.resolution,
                               observation_width=args.resolution)
     camera_names = parse_camera_names(env_cfg.camera_name)
@@ -432,7 +437,8 @@ def main() -> None:
                 continue
             task = suite.get_task(tid)
             if runtime is not None:
-                infer = make_budget_infer(client, task.language, args.horizon, runtime, make_element)
+                infer = make_budget_infer(client, task.language, args.horizon, runtime, make_element,
+                                          lambda delay, end: paper_weights(delay, end, args.horizon))
             else:
                 infer = make_infer(client, task.language, args.horizon, args.n_samples, aac, rtc_weights,
                                    args.max_guidance_weight, jacobian, gate)

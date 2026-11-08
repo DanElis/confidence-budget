@@ -120,6 +120,52 @@ def test_the_budget_needs_the_plan_in_model_units():
         run_batch([Env()], infer, LoopConfig(H, 2, False, 12), GivenStride(H), [0], (H, 32), keep_entropy=True)
 
 
+class RecordingClient(Client):
+    def __init__(self):
+        super().__init__()
+        self.elements = []
+
+    def infer(self, element):
+        self.elements.append(element)
+        return super().infer(element)
+
+
+def pair_config(mode="fixed", **extra):
+    return {"mode": mode, "pairs": [[2, -1], [2, 2], [4, -1], [4, 2], [6, 2], [8, -1]], "option_ticks": 12,
+            "max_steps": 40, **extra}
+
+
+def test_pairs_and_the_planner():
+    assert GivenStride(H)(np.array([4, 2]), None, 2).mask_end == 4
+    assert GivenStride(H)(np.array([4, -1]), None, 2).mask_end == -1
+    assert GivenStride(H)(np.asarray(4), None, 2).stride == 4  # the naive budget's scalar signal
+    runtime = BudgetRuntime(pair_config(fixed=[4, 2]), 0, H, 2)
+    assert runtime.uses_rtc and not BudgetRuntime(config(), 0, H, 2).uses_rtc
+    with pytest.raises(ValueError, match="feasible"):
+        BudgetRuntime(pair_config(pairs=[[6, 4]], fixed=6), 0, H, 2)  # d + r = 6 > H - s = 4
+
+
+def test_rtc_pair_guides_toward_the_old_plan_from_the_second_request():
+    from eval_openpi import paper_weights
+
+    client = RecordingClient()
+    infer = make_budget_infer(client, "task", H, BudgetRuntime(pair_config(fixed=[4, 2]), 0, H, 2))
+    res = run_batch([Env()], infer, LoopConfig(H, 2, True, 20), GivenStride(H), [0], (H, 32), keep_entropy=True)
+    first, *rest = client.elements
+    assert "rtc_target" not in first and rest and all(e["rtc_jacobian"] and e["rtc_max_weight"] == 5.0 for e in rest)
+    np.testing.assert_array_equal(rest[0]["rtc_weights"], paper_weights(2, 4, H))  # frozen d = 2, window up to d + r
+    np.testing.assert_array_equal(rest[0]["rtc_target"][:H - 4], np.full((H - 4, 32), 1.0))  # the rest of plan 1
+    assert [c["mask_end"] for c in res.chunks] == [4] * len(res.chunks)
+    assert [c["budget_guided"] for c in res.chunks] == [0.0] + [1.0] * (len(res.chunks) - 1)
+
+
+def test_naive_pair_sends_no_guidance_even_in_a_guided_loop():
+    client = RecordingClient()
+    infer = make_budget_infer(client, "task", H, BudgetRuntime(pair_config(fixed=[4, -1]), 0, H, 2))
+    run_batch([Env()], infer, LoopConfig(H, 2, True, 20), GivenStride(H), [0], (H, 32), keep_entropy=True)
+    assert len(client.elements) > 1 and not any("rtc_target" in e for e in client.elements)
+
+
 def test_args_and_progress_key(tmp_path):
     path = tmp_path / "b.json"
     path.write_text(json.dumps(config()))
@@ -139,21 +185,57 @@ def test_args_and_progress_key(tmp_path):
 SUITE = "libero_object_pos_y0.1"
 
 
-def write_run(path: Path, rows, stride=None):
-    """rows: [(task, init, success, [(step, stride, action, prob, decision, x)])] -> a run directory as eval_openpi writes."""
+def write_run(path: Path, rows, stride=None, **config):
+    """rows: [(task, init, success, [(step, stride, action, prob, decision, x[, r])])] -> a run directory as eval_openpi
+    writes. Decisions without r are those of the naive budget, which logged no r."""
     path.mkdir(parents=True)
     episodes, chunks = [], []
     for task, init, success, decisions in rows:
         length = 40
         episodes.append({"task_id": task, "init_state": init, "success": bool(success), "length": length,
                          "n_inference": len(decisions), "mean_stride": None, "sparc": 0.0})
-        for step, s, action, prob, decision, x in decisions:
+        for step, s, action, prob, decision, x, *r in decisions:
             chunks.append({"task_id": task, "init_state": init, "step": step, "stride": s, "budget_x": list(map(float, x)),
-                           "budget_action": float(action), "budget_prob": prob, "budget_decision": float(decision)})
+                           "budget_action": float(action), "budget_prob": prob, "budget_decision": float(decision)}
+                          | ({"budget_r": float(r[0])} if r else {}))
     (path / f"{SUITE}.json").write_text(json.dumps({"success_rate": 0.0, "episodes": episodes}))
     (path / f"{SUITE}_chunks.json").write_text(json.dumps(chunks))
-    (path / "config.json").write_text(json.dumps({"stride": str(stride)}))
+    (path / "config.json").write_text(json.dumps({"stride": str(stride), "horizon": H, **config}))
     return path
+
+
+def test_naive_runs_pool_with_rtc_runs_as_pairs(tmp_path):
+    x = np.zeros(FEATURE_DIM)
+    naive = write_run(tmp_path / "n", [(0, 0, 1, [(0, 4, 1, 0.25, 1, x)])])  # the naive budget: index 1 of its grid
+    rtc = write_run(tmp_path / "r", [(0, 1, 0, [(0, 2, 1, 1 / 3, 1, x, 2)]), (0, 2, 1, [(0, 4, 2, 1 / 3, 1, x, -1)])])
+    grid = ["2:-1", "2:2", "4:-1"]
+    data = load_decisions([naive, rtc], grid)
+    assert list(data["action"]) == [2, 1, 2] and list(data["prob"]) == pytest.approx([0.25, 1 / 3, 1 / 3])
+    with pytest.raises(RuntimeError, match="grid"):
+        load_decisions([rtc], ["2:-1", "4:-1"])  # (2, 2) is not on this grid
+
+
+def test_constants_choose_rtc_only_where_it_beats_naive(tmp_path):
+    rows = lambda success: [(0, i, ok, []) for i, ok in enumerate(success)]  # noqa: E731
+    runs = [write_run(tmp_path / "n4", rows([1, 0, 1, 0]), stride=4, guidance="none", mask_end="None"),
+            write_run(tmp_path / "r4", rows([1, 1, 1, 0]), stride=4, guidance="paper", mask_end="4"),
+            write_run(tmp_path / "n6", rows([1, 1, 0, 0]), stride=6, guidance="none", mask_end="None"),
+            write_run(tmp_path / "r6", rows([1, 1, 0, 0]), stride=6, guidance="paper", mask_end="4")]
+    main(["constants", *map(str, runs), "--delay", "2", "--level", "0.95", "--out", str(tmp_path / "c")])
+    best = json.loads((tmp_path / "c" / "constants.json").read_text())["best"]
+    assert (best["4"]["s"], best["4"]["r"]) == (4, 2) and best["6"]["r"] == -1  # tie at s = 6: naive
+    text = (tmp_path / "c" / "constants.md").read_text()
+    assert "s=4 r=2 | 75.0 | +25.0" in text and "s=6 naive | 50.0 | —" in text
+
+
+def test_config_writes_pairs_only_with_rtc(tmp_path):
+    common = ["--option-ticks", "40", "--max-steps", "280"]
+    main(["config", "--out", str(tmp_path / "a.json"), "--mode", "explore", "--grid", "2", "4", *common])
+    assert json.loads((tmp_path / "a.json").read_text())["grid"] == [2, 4]  # the naive configs stay as they were
+    main(["config", "--out", str(tmp_path / "b.json"), "--mode", "fixed", "--grid", "2:-1", "4:2", "--fixed", "4:2", *common])
+    b = json.loads((tmp_path / "b.json").read_text())
+    assert b["pairs"] == [[2, -1], [4, 2]] and b["fixed"] == [4, 2]
+    assert BudgetRuntime(b, 0, H, 2).fixed == (4, 2)
 
 
 def explore_rows(seed, n_tasks=6, n_init=10):
@@ -210,9 +292,9 @@ def test_fit_finds_a_state_dependent_step_and_the_policy_deploys(tmp_path):
     runtime = BudgetRuntime(config("policy", policy=str(out / "policy.pt")), 0, H, 2)
     x = np.zeros(FEATURE_DIM, np.float32)
     x[0] = 3.0
-    hi = runtime.select(x, 0, 0)[2]
+    hi = runtime.select(x, 0, 0)[2][0]
     x[0] = -3.0
-    assert (hi, runtime.select(x, 0, 0)[2]) != (8, 2)  # never the opposite of the rule in the data
+    assert (hi, runtime.select(x, 0, 0)[2][0]) != (8, 2)  # never the opposite of the rule in the data
 
 
 def test_calibrate_moves_the_rate(tmp_path):
@@ -250,6 +332,8 @@ def test_report_rows_and_level(tmp_path):
     assert "97.5% CI" in text and "PRIMARY learned - fixed at its rate | +50.0" in text
     assert "best constant (fewer calls) | +25.0" in text and "| 2.000 | False |" in text  # twice the calls of best
     assert "fewer calls" not in report(fixed, learned, control, best=fixed)
+    prior = run("p", [1, 1, 0, 1], 2)
+    assert "learned - learned s only (naive) | +25.0" in report(fixed, learned, control, prior=prior)
 
 
 def test_headroom_cross_fits_the_per_scene_step(tmp_path):
