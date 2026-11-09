@@ -12,6 +12,9 @@
 # PORT (8124), RUNS (runs). Full configuration: 3 speeds x 600 = 1800 episodes. Finished speeds are skipped.
 # ITEM_IDS_FILE: JSON list of exact item ids (budget_items.py), replaces LIMIT; order and worker slots are preserved.
 #
+# SERVER=openpi: openpi's pi05_libero (H = 10, openpi_dynamic_server.py, venv of libero_pro/third_party/openpi)
+# instead of our LeRobot pi0.5; K and --actions-per-chunk must then be <= 10, RTC is the paper's (Jacobian, beta = 5).
+#
 # RUNNER_ARGS: extra arguments for the benchmark runner (e.g. "--prefetch-threshold 4" for the adaptive step).
 # KEEP_CHUNK=1: the client keeps the whole returned chunk instead of trimming it to K (patch_runner.sh).
 #
@@ -83,8 +86,16 @@ if (( ${#todo[@]} == 0 )); then echo "$(date '+%F %T') $NAME: all speeds done"; 
 echo "$(date '+%F %T') $NAME: strategy=$STRATEGY K=$K latency=$LATENCY speeds=${todo[*]} servers=$SERVERS workers=$WORKERS server_args=${SERVER_ARGS[*]}"
 git -C "$HERE" log -1 --oneline
 for (( i = 0; i < SERVERS; i++ )); do
-  (cd "$HERE/../libero_pro" && exec uv run --with websockets --with msgpack python "$HERE/policy_server.py" \
-     --port $((PORT + i)) --log-jsonl "$OUT/signals_$i.jsonl" "${SERVER_ARGS[@]}") > "$OUT/server_$i.log" 2>&1 &
+  if [[ ${SERVER:-lerobot} == openpi ]]; then  # openpi's pi05_libero, H = 10 (openpi_dynamic_server.py)
+    OPENPI_DIR="$HERE/../libero_pro/third_party/openpi"
+    [[ -x $OPENPI_DIR/.venv/bin/python ]] || { echo "no $OPENPI_DIR/.venv: run libero_pro/scripts/setup_openpi.sh"; exit 1; }
+    (cd "$OPENPI_DIR" && exec env -u VIRTUAL_ENV -u PYTHONPATH XLA_PYTHON_CLIENT_PREALLOCATE=false \
+       CUDA_VISIBLE_DEVICES="${GPU:-0}" .venv/bin/python "$HERE/openpi_dynamic_server.py" \
+       --port $((PORT + i)) --log-jsonl "$OUT/signals_$i.jsonl" "${SERVER_ARGS[@]}") > "$OUT/server_$i.log" 2>&1 &
+  else
+    (cd "$HERE/../libero_pro" && exec uv run --with websockets --with msgpack python "$HERE/policy_server.py" \
+       --port $((PORT + i)) --log-jsonl "$OUT/signals_$i.jsonl" "${SERVER_ARGS[@]}") > "$OUT/server_$i.log" 2>&1 &
+  fi
   pids+=($!)
 done
 ports=()
