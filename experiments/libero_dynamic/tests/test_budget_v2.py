@@ -304,3 +304,56 @@ def test_v2_arguments_fail_closed(tmp_path):
     with pytest.raises(SystemExit):
         ps.parse_args(["--option-budget", "c.json", "--budget-head", "h.pt", "--budget-traces", "t", "--mode", "rtc", "--actions-per-chunk", "50"])
     assert ps.parse_args(["--option-budget", "c.json", "--budget-traces", "t", "--mode", "rtc", "--actions-per-chunk", "50"]).option_budget == "c.json"
+
+
+# ---------------------------------------------------------------- openpi pi05_libero, H = 10
+
+def test_features_scale_with_the_horizon():
+    frames = np.zeros((8, 8)), np.zeros((8, 8))
+    x = actor_features(np.ones(8), np.zeros(8), np.zeros((6, 7)), 2, 40, 600, frames, frames, None, (4, -1), horizon=10)
+    assert x.shape == (ACTOR_DIM,)
+    assert x[8] == pytest.approx(1 / 4)  # age = H - len(left) = 4
+    np.testing.assert_allclose(x[BLOCKS["context"][0] + 1:BLOCKS["context"][1]], [.2, .4, -.1], rtol=1e-5)
+    assert x[BLOCKS["residual"][0]:BLOCKS["residual"][1]].sum() == 0  # openpi: no residual
+    assert plan_features(np.zeros((6, 7)), 2, 4, horizon=10)[17] == pytest.approx(.6)
+
+
+def test_naive_pairs_and_the_short_horizon(tmp_path):
+    check_pair((2, -1), 2, 10)
+    check_pair((3, 4), 3, 10)
+    for pair, d in (((9, -1), 2), ((5, 4), 3), ((2, -2), 2), ((2, 0), 3)):
+        with pytest.raises(ValueError, match="repeatable"):
+            check_pair(pair, d, 10)
+    pairs = [(3, -1), (3, 2), (5, -1), (7, -1)]
+    rt = runtime(tmp_path, pairs=pairs, delay=3, horizon=10, mode="fixed", fixed=[5, -1])
+    state = {}
+    first = rt.choose(request(0), state, np.zeros((0, 7)), 3, 10, None, np.zeros(0))
+    assert (first["s"], first["r"], first["horizon"]) == (5, -1, 10)  # naive stays naive, not clamped to 0
+    assert rt.choose(request(5), state, np.zeros((5, 7)), 3, 10, None, np.zeros(0))["r"] == -1
+    with pytest.raises(ValueError, match="does not match"):
+        rt.choose(request(10), state, np.zeros((5, 7)), 3, 50, None, np.zeros(0))
+    explore = runtime(tmp_path, pairs=pairs, delay=3, horizon=10)
+    x = np.zeros(ACTOR_DIM, np.float32)
+    assert {explore.select(x, None, {**request(0), "budget_episode": str(i)}, 0)[2] for i in range(64)} == set(pairs)
+
+
+def test_openpi_arguments_fail_closed(tmp_path):
+    from budget_v2 import parse_pairs, reference_masks, runner_ticks
+
+    out = str(tmp_path)
+    base = ["--out", out, "--server", "openpi", "--reference-stride", "5"]
+    a = parse_args(base + ["--delay", "3", "--latency", "0.134", "--pairs", "3:-1 3:2 3:4 5:-1 5:2 7:-1"])
+    assert a.guidance == 5 and not a.rule and parse_pairs(a.pairs)[1] == (3, 2)
+    assert parse_args(["--out", out]).guidance == 2 and parse_args(["--out", out]).rule
+    assert reference_masks(parse_pairs(a.pairs), 5, 3, 10) == [-1, 2]
+    assert reference_masks([(2, -1), (4, -1)], 5, 2, 10) == [-1]
+    assert runner_ticks(0.091) == 2 and runner_ticks(0.134) == 3 and runner_ticks(0.15) == 3 and runner_ticks(0.1) == 2
+    for bad in (["--delay", "3"],  # no pairs
+                ["--delay", "3", "--latency", "0.091", "--pairs", "3:-1"],  # latency gives d = 2
+                ["--delay", "3", "--pairs", "3:-1 5:4"],  # not repeatable
+                ["--delay", "2", "--pairs", "2:-1 2:-1"],  # duplicate
+                ["--delay", "2", "--pairs", "2:x"]):
+        with pytest.raises(SystemExit):
+            parse_args(base + bad)
+    with pytest.raises(SystemExit):
+        parse_args(["--out", out, "--pairs", "7:0"])  # explicit pairs are for openpi

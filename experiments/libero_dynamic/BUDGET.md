@@ -1,5 +1,36 @@
 # Joint before-generation budget on LIBERO-Dynamic
 
+## Option budget on openpi pi05_libero (H = 10): `openpi_budget_dynamic.sh s|sr`
+
+Code only (10.11.2026), not run yet. The v2 pipeline below with `budget_v2.py --server openpi`: the decision runs in
+`openpi_dynamic_server.py --option-budget` before generation, from the same 59 deployable features. openpi has no
+prefix hook there, so the residual block is empty and no latent is logged; no gripper rule, whose pairs are for H = 50.
+r is the RTC window after the d frozen actions (mask end d + r, the paper's weights, beta = 5), r = -1 is naive. The
+runner latency is the calibrated request time from `runs/openpi/latency.txt`, one for every pair of a variant.
+
+| variant | d (latency) | pairs (s, r) | constant control at equal rate |
+|---|---|---|---|
+| `s` | 2 (plain, 0.091 s) | (2,-1) (4,-1) (6,-1) (8,-1) | naive s = 5 |
+| `sr` | 3 (RTC, 0.134 s) | (3,-1) (3,2) (3,4) (5,-1) (5,2) (7,-1) | s = 5, r in {-1, 2} chosen on validation |
+
+In `sr` the naive pairs also pay the RTC latency, which is conservative for them; the two variants are therefore
+compared each with its own control, not with each other. Splits, gates, primary and secondary comparisons as in v2:
+120 scenes, trajectories 0,1 / 2 / 3,4, 240 paired test episodes. The offline gates are reported in `fit_1/fit.md`;
+the wrapper passes `--force` (FORCE=1) so validation and test run anyway; FORCE=0 restores the stop.
+About 2000-2300 episodes per variant, ~8-9 h each at the throughput of the base runs (600 episodes in ~2 h 15 min).
+
+```bash
+cd ~/work/cv/confidence-budget/experiments/libero_dynamic && bash openpi_budget_dynamic.sh s --smoke-only
+```
+
+Inspect `runs/openpi_budget_s/experiment/smoke_done.json` (`ticks_required` should not exceed d), then in tmux:
+
+```bash
+cd ~/work/cv/confidence-budget/experiments/libero_dynamic && tmux new -d -s budget_dyn "bash openpi_budget_dynamic.sh s && bash openpi_budget_dynamic.sh sr"
+```
+
+Reports: `runs/openpi_budget_{s,sr}/experiment/report.md`, `fit_1/fit.md`, `selection.json`.
+
 ## Option budget (v2): `night_budget_v2.sh`
 
 Code only; nothing below has been run yet. The PPO pipeline further down is kept for the record.

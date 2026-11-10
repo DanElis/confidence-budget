@@ -29,11 +29,14 @@ class BudgetPolicy:
         request = self.inner._observation(obs, language)
         request.update(budget_id=obs["budget_id"], budget_step=obs["budget_step"],
                        budget_episode=obs["budget_episode"], budget_priv=obs["budget_priv"])
-        request["prev_chunk_left_over"] = np.asarray(prev_chunk_left_over, np.float32).reshape(-1, self.inner.action_dim)
+        left = np.asarray(prev_chunk_left_over, np.float32)
+        # openpi's server returns 32-dimensional original actions: keep a 2-D leftover as it is
+        request["prev_chunk_left_over"] = left if left.ndim == 2 else left.reshape(-1, self.inner.action_dim)
         request["inference_delay_steps"] = int(inference_delay_steps)
         result = self.inner.client.infer(request)
-        if "budget" not in result or len(result["actions"]) != 50 or len(result["original_actions"]) != 50:
-            raise RuntimeError("budget strategy requires --budget-head and the full H=50 response")
+        horizon = int(result.get("budget", {}).get("horizon", 50))
+        if "budget" not in result or len(result["actions"]) != horizon or len(result["original_actions"]) != horizon:
+            raise RuntimeError("budget strategy requires a budget server and the full chunk of length H")
         self.extras.append(result["budget"])
         # Bypass the client's --replan-steps slicing: the queue retains the full plan.
         return {"actions": np.asarray(result["actions"], np.float32),

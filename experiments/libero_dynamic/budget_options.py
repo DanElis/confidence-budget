@@ -5,6 +5,8 @@ old plan's residual, and one chunk is generated per request. Per-connection `sta
 Modes: explore (uniform), epsilon (greedy + uniform), policy (greedy), marginal (state-independent action
 frequencies), fixed (any constant pair, on or off the grid), rule (pair by the gripper phase of the robot state).
 Random numbers depend on the request content only, not on the order in which workers reach a shared server.
+Config "horizon" (default 50) is the chunk length H; r = -1 (NAIVE) is a pair without guidance (naive switching),
+allowed when the server supports it (openpi_dynamic_server.py).
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from budget_features import HORIZON, actor_features, gray, gripper_width
 from budget_privileged import N_OBJECTS, PRIV_DIM
 
 MODES = ("explore", "epsilon", "policy", "marginal", "fixed", "rule")
+NAIVE = -1
 
 
 def request_rng(seed, obs, step):
@@ -30,8 +33,8 @@ def request_rng(seed, obs, step):
 
 def check_pair(pair, delay, horizon=HORIZON):
     s, r = pair
-    if not max(1, delay) <= s <= horizon - delay or r < 0 or s + r + delay > horizon:
-        raise ValueError(f"pair {pair} is not repeatable: require d <= s <= H-d and s+r+d <= H")
+    if not max(1, delay) <= s <= horizon - delay or r < NAIVE or s + max(r, 0) + delay > horizon:
+        raise ValueError(f"pair {pair} is not repeatable: require d <= s <= H-d, r >= -1 (naive) and s+r+d <= H")
 
 
 class OptionRuntime:
@@ -41,15 +44,16 @@ class OptionRuntime:
         if c["mode"] not in MODES:
             raise ValueError(f"unknown budget mode {c['mode']}")
         self.mode, self.delay, self.option_ticks = c["mode"], int(c["delay"]), int(c["option_ticks"])
+        self.horizon = int(c.get("horizon", HORIZON))
         self.pairs = [tuple(p) for p in c["pairs"]]
         for pair in self.pairs:
-            check_pair(pair, self.delay)
+            check_pair(pair, self.delay, self.horizon)
         self.seed, self.max_steps = int(c["seed"]), int(c["max_steps"])
         self.fixed = tuple(c["fixed"]) if c.get("fixed") else None
         self.rule = {k: tuple(c["rule"][k]) for k in ("open", "closed")} if c.get("rule") else None
         for pair in (self.fixed, *(self.rule.values() if self.rule else ())):
             if pair is not None:
-                check_pair(pair, self.delay)
+                check_pair(pair, self.delay, self.horizon)
         self.width = float(c.get("rule_width", .07))
         self.epsilon = float(c.get("epsilon", 0.))
         self.marginal = np.asarray(c["marginal"], np.float64) if c.get("marginal") else None
@@ -89,8 +93,8 @@ class OptionRuntime:
 
     def choose(self, obs, state, left, delay, horizon, residual, latent):
         started = time.perf_counter()
-        if horizon != HORIZON or delay != self.delay:
-            raise ValueError(f"budget H/d {HORIZON}/{self.delay} does not match the request {horizon}/{delay}")
+        if horizon != self.horizon or delay != self.delay:
+            raise ValueError(f"budget H/d {self.horizon}/{self.delay} does not match the request {horizon}/{delay}")
         uid, step = str(obs["budget_id"]), int(obs["budget_step"])
         if not uid.isalnum():
             raise ValueError("invalid budget trace id")
@@ -103,7 +107,7 @@ class OptionRuntime:
         decision = "option" not in state or step >= state["option"]["end"]
         if decision:
             x = actor_features(robot, state.get("budget_robot"), left, delay, step, self.max_steps, frames,
-                               state.get("budget_frames"), residual, state.get("budget_pair", (0, 0)))
+                               state.get("budget_frames"), residual, state.get("budget_pair", (0, 0)), self.horizon)
             action, prob, pair = self.select(x, latent, obs, step)
             state["option"] = {"pair": pair, "end": step + self.option_ticks}
             state["budget_pair"] = pair
@@ -111,7 +115,8 @@ class OptionRuntime:
                                 pair=np.asarray(pair), latent=np.asarray(latent, np.float16).ravel())
         s, r = state["option"]["pair"]
         # Only the first request of an episode has too short a plan: check_pair covers every later one.
-        r = min(r, max(0, len(left) - delay))
+        if r != NAIVE:
+            r = min(r, max(0, len(left) - delay))
         state.update(budget_frames=frames, budget_robot=robot.copy())
-        return {"id": uid, "s": int(s), "r": int(r), "step": step, "decision": bool(decision),
+        return {"id": uid, "s": int(s), "r": int(r), "step": step, "decision": bool(decision), "horizon": self.horizon,
                 "budget_elapsed_s": time.perf_counter() - started}

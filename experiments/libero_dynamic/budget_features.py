@@ -7,6 +7,7 @@ Blocks (BLOCKS gives their slices; ablations zero one of them):
             wrist camera mean + max, presence flag. Pooled ImageNet features barely change when a small object moves.
   residual  old plan's denoising residual under the fresh prefix (selection.plan_residual) over three windows + flag
   context   t/T, d/H, previous pair
+H defaults to 50 (LeRobot pi0.5); openpi's pi05_libero passes horizon=10. The dimension does not depend on H.
 """
 from __future__ import annotations
 
@@ -41,14 +42,14 @@ def motion_features(frames, previous, age):
     return out
 
 
-def _windows(delay):
-    return (0, delay), (delay, delay + 4), (delay + 4, delay + 12), (delay + 12, delay + 24), (delay + 24, HORIZON)
+def _windows(delay, horizon=HORIZON):
+    return (0, delay), (delay, delay + 4), (delay + 4, delay + 12), (delay + 12, delay + 24), (delay + 24, max(horizon, delay + 24))
 
 
-def plan_features(left, delay, age):
+def plan_features(left, delay, age, horizon=HORIZON):
     left = np.asarray(left, np.float32).reshape(-1, 7)
     out = np.zeros(19, np.float32)
-    for i, (start, end) in enumerate(_windows(delay)):
+    for i, (start, end) in enumerate(_windows(delay, horizon)):
         part = left[start:end]
         if len(part):
             out[3 * i:3 * i + 3] = np.abs(part[:, :3]).mean(), np.abs(part[:, 3:6]).mean(), part[:, 6].mean()
@@ -56,8 +57,8 @@ def plan_features(left, delay, age):
     if len(future):
         flips = np.flatnonzero(np.abs(future - future[0]) > GRIPPER_FLIP)
         if len(flips):
-            out[15:17] = 1., flips[0] / HORIZON
-    out[17:19] = len(left) / HORIZON, age / HORIZON
+            out[15:17] = 1., flips[0] / horizon
+    out[17:19] = len(left) / horizon, age / horizon
     return out
 
 
@@ -89,11 +90,12 @@ def gripper_width(x):
     return x[..., 6] - x[..., 7]
 
 
-def actor_features(state, previous_state, left, delay, step, max_steps, frames, previous_frames, residual, previous_pair):
+def actor_features(state, previous_state, left, delay, step, max_steps, frames, previous_frames, residual, previous_pair,
+                   horizon=HORIZON):
     left = np.asarray(left, np.float32).reshape(-1, 7)
-    age = HORIZON - len(left) if len(left) else 0
-    context = np.array([step / max_steps, delay / HORIZON, previous_pair[0] / HORIZON, previous_pair[1] / HORIZON], np.float32)
-    x = np.concatenate((robot_features(state, previous_state, age), plan_features(left, delay, age),
+    age = horizon - len(left) if len(left) else 0
+    context = np.array([step / max_steps, delay / horizon, previous_pair[0] / horizon, previous_pair[1] / horizon], np.float32)
+    x = np.concatenate((robot_features(state, previous_state, age), plan_features(left, delay, age, horizon),
                         motion_features(frames, previous_frames, age), residual_features(residual, delay, len(left)),
                         context)).astype(np.float32)
     if x.shape != (ACTOR_DIM,) or not np.isfinite(x).all():
