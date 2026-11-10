@@ -69,11 +69,18 @@ def plan_stats(run: Path) -> str:
         return "—"
     s = [r["s"] for r in rows if "s" in r]
     h = [r["h_star"] for r in rows if "h_star" in r]
-    sel = [r["sel"] != 0 for r in rows]
-    parts = [f"sel≠0 {statistics.mean(sel):.2f}"]
+    parts = []
     if s:
-        parts = [f"s {statistics.mean(s):.1f}", f"h* {statistics.mean(h):.1f}"] + parts
-    return ", ".join(parts)
+        parts.append(f"s {statistics.mean(s):.1f}")
+    if h:
+        parts.append(f"h* {statistics.mean(h):.1f}")
+    sel = [r["sel"] != 0 for r in rows if "sel" in r]  # openpi_dynamic_server.py logs no sample index
+    if sel:
+        parts.append(f"sel≠0 {statistics.mean(sel):.2f}")
+    guided = [bool(r["guided"]) for r in rows if "guided" in r]
+    if guided:
+        parts.append(f"guided {statistics.mean(guided):.2f}")
+    return ", ".join(parts) or "—"
 
 
 def paired(ref: dict, other: dict, n_boot=2000, seed=0):
