@@ -30,6 +30,7 @@ from learn_budget import metrics, paired_delta, read_episodes
 
 HERE = Path(__file__).resolve().parent
 EQUAL_RATE = .05
+RETRIES = 2  # reruns of items lost to infrastructure errors
 
 
 def nearest_stride(rate, delay, horizon=50):
@@ -97,52 +98,89 @@ class Experiment:
         self.files = write_splits(self.items, self.out / "splits")
         print({k: len(v) for k, v in self.items.items()}, flush=True)
 
+    def finished_run(self, run):
+        """run_dynamic.sh wrote the speed's summary: every item has a manifest row (possibly an infrastructure error)."""
+        v = self.runs / run / f"v{self.args.speed}"
+        return (v / "evaluation/summary.json").exists() or (v / "summary.json").exists()
+
+    def launch(self, run, item_file, config, traces, steps, label):
+        a = self.args
+        env = os.environ.copy()
+        env.pop("CORR_HEAD", None)
+        env.update(RUNS=str(self.runs), SPEEDS=str(a.speed), LEVELS=a.levels, TRAJ="0 1 2 3 4", LIMIT="",
+                   ITEM_IDS_FILE=str(item_file), SERVERS=str(a.servers), WORKERS=str(a.workers),
+                   PORT=str(a.port), KEEP_CHUNK="1", MAX_STEPS=str(steps or a.max_steps),
+                   RUNNER_ARGS=f"--control-mode learned_budget_queue --seed {a.seed}")
+        if self.openpi:
+            env["SERVER"] = "openpi"
+        cmd = ["bash", str(HERE / "run_dynamic.sh"), run, "rtc", "8", str(self.latency),
+               "--actions-per-chunk", str(self.horizon), "--max-guidance-weight", str(a.guidance),
+               "--option-budget", str(config), "--budget-traces", str(traces)]
+        print(f"{time.strftime('%F %T')} rollout {run}: {label}", flush=True)
+        with (self.out / f"{run}.log").open("w") as log:
+            process = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                rc = process.wait(timeout=a.rollout_timeout_hours * 3600)
+                if rc:
+                    raise RuntimeError(f"rollout {run} exited {rc}; see {self.out / (run + '.log')}")
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+
     def rollout(self, name, split, mode, seed=0, steps=None, option_ticks=None, **extra):
+        """One configuration on an explicit item list. Items lost to an infrastructure error (e.g. a websocket handshake
+        timeout) are rerun alone, up to RETRIES times, into <name>_retry<k>; they are listed in retries.json, since a
+        rerun item runs in another worker slot (another env seed) than in the other configurations."""
         a = self.args
         run, traces, mark = self.runs / name, self.traces / name, self.marks / name
-        if not mark.exists():
-            for partial in (run, traces):  # only directories of this experiment; never reused unless finished
+        config = self.configs / f"{name}.json"
+        if not mark.exists() and not self.finished_run(name):
+            for partial in [run, traces, *self.runs.glob(f"{name}_retry*")]:  # never reused unless finished
                 if partial.exists():
                     shutil.rmtree(partial)
             traces.mkdir()
-            config = self.configs / f"{name}.json"
             config.write_text(json.dumps({"mode": mode, "pairs": self.pairs, "delay": a.delay, "seed": seed, "horizon": self.horizon,
                                           "option_ticks": a.option_ticks if option_ticks is None else option_ticks,
                                           "max_steps": a.max_steps, "rule_width": a.rule_width, **extra}, indent=1))
-            env = os.environ.copy()
-            env.pop("CORR_HEAD", None)
-            env.update(RUNS=str(self.runs), SPEEDS=str(a.speed), LEVELS=a.levels, TRAJ="0 1 2 3 4", LIMIT="",
-                       ITEM_IDS_FILE=str(self.files[split]), SERVERS=str(a.servers), WORKERS=str(a.workers),
-                       PORT=str(a.port), KEEP_CHUNK="1", MAX_STEPS=str(steps or a.max_steps),
-                       RUNNER_ARGS=f"--control-mode learned_budget_queue --seed {a.seed}")
-            if self.openpi:
-                env["SERVER"] = "openpi"
-            cmd = ["bash", str(HERE / "run_dynamic.sh"), name, "rtc", "8", str(self.latency),
-                   "--actions-per-chunk", str(self.horizon), "--max-guidance-weight", str(a.guidance),
-                   "--option-budget", str(config), "--budget-traces", str(traces)]
-            print(f"{time.strftime('%F %T')} rollout {name}: {split} {mode} {extra}", flush=True)
-            with (self.out / f"{name}.log").open("w") as log:
-                process = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-                try:
-                    rc = process.wait(timeout=a.rollout_timeout_hours * 3600)
-                    if rc:
-                        raise RuntimeError(f"rollout {name} exited {rc}; see {self.out / (name + '.log')}")
-                finally:
-                    try:
-                        os.killpg(process.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        process.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
-        rows = read_episodes(run, None, len(self.items[split]))
+            self.launch(name, self.files[split], config, traces, steps, f"{split} {mode} {extra}")
+        failed = []
+        rows = read_episodes(run, None, None, failed=failed)
+        retried = []
+        for k in range(1, RETRIES + 1):
+            if not failed:
+                break
+            retry = f"{name}_retry{k}"
+            if not mark.exists() and not self.finished_run(retry):
+                if (self.runs / retry).exists():
+                    shutil.rmtree(self.runs / retry)
+                item_file = self.out / "splits" / f"{retry}.json"
+                item_file.write_text(json.dumps(sorted(failed), indent=0))
+                self.launch(retry, item_file, config, traces, steps, f"rerun of {len(failed)} items after infrastructure errors")
+            retried += failed
+            failed = []
+            more = read_episodes(self.runs / retry, None, None, failed=failed)
+            if set(more) & set(rows):
+                raise RuntimeError(f"rerun {retry} repeats finished items")
+            rows.update(more)
+        if failed:
+            raise RuntimeError(f"rollout {name}: infrastructure errors persist after {RETRIES} reruns: {failed}")
         if set(rows) != set(self.items[split]):
             raise RuntimeError(f"rollout {name} ran other items than its explicit list")
         if not mark.exists():
-            mark.write_text(json.dumps({"time": time.strftime("%F %T")}))
-            print(json.dumps({"run": name, **metrics(rows, 0, 1, 1)}), flush=True)
+            if retried:
+                path = self.out / "retries.json"
+                log = json.loads(path.read_text()) if path.exists() else {}
+                log[name] = sorted(set(retried))
+                path.write_text(json.dumps(log, indent=1))
+            mark.write_text(json.dumps({"time": time.strftime("%F %T"), "retried": sorted(set(retried))}))
+            print(json.dumps({"run": name, "retried": len(set(retried)), **metrics(rows, 0, 1, 1)}), flush=True)
         return rows
 
     def segments(self, names_rows):
@@ -274,6 +312,10 @@ def write_report(path, runs, selection, args, fit):
         delta, low, high = paired_delta(runs[reference], runs[candidate])
         ratio = rate_of(runs[candidate]) / rate_of(runs[reference])
         lines.append(f"| {label} | {delta:+.2f} [{low:+.2f}; {high:+.2f}] | {ratio:.3f} | {abs(ratio - 1) <= EQUAL_RATE} |")
+    retries = path.parent / "retries.json"
+    if retries.exists():
+        counts = {k: len(v) for k, v in json.loads(retries.read_text()).items()}
+        lines += ["", f"Items rerun after infrastructure errors (other worker slot, so another env seed): {counts}."]
     lines += ["", "A gain counts only if the primary CI is above zero at equal rate; the other rows are secondary. "
               "CI bootstraps episodes, and the episodes of one scene are not independent. Latency is the simulated "
               "fixed d: compare the request wall time with d/20 before any real-time claim."]

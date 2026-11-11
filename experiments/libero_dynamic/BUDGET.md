@@ -31,6 +31,10 @@ cd ~/work/cv/confidence-budget/experiments/libero_dynamic && tmux new -d -s budg
 
 Reports: `runs/openpi_budget_{s,sr}/experiment/report.md`, `fit_1/fit.md`, `selection.json`.
 
+Items lost to an infrastructure error (e.g. a websocket handshake timeout) are rerun alone, up to two times
+(`<run>_retry<k>`), and listed in `retries.json` and the report: a rerun item runs in another worker slot, so with
+another env seed than in the other configurations. A finished but unmarked run is reused on restart, not repeated.
+
 ## Option budget (v2): `night_budget_v2.sh`
 
 Code only; nothing below has been run yet. The PPO pipeline further down is kept for the record.

@@ -22,7 +22,9 @@ from budget_head import BudgetHead, action_pairs, load_head, save_head
 HERE = Path(__file__).resolve().parent
 
 
-def read_episodes(run, traces=None, expected=None):
+def read_episodes(run, traces=None, expected=None, failed=None):
+    """Manifest rows of a run by item id. An infrastructure error raises, unless a list `failed` is given: then the
+    item ids are appended to it and the items are left out."""
     rows = {}
     for manifest in sorted(Path(run).rglob("manifest.jsonl")):
         for line in manifest.read_text().splitlines():
@@ -30,6 +32,9 @@ def read_episodes(run, traces=None, expected=None):
                 continue
             row = json.loads(line)
             if row.get("status") != "ok" or row.get("error"):
+                if failed is not None:
+                    failed.append(row["item_id"])
+                    continue
                 raise RuntimeError(f"infrastructure error: {row.get('item_id')}: {row.get('error')}")
             key = row["item_id"]
             if key in rows:
@@ -57,7 +62,7 @@ def read_episodes(run, traces=None, expected=None):
                     samples.append(sample)
                 row["samples"] = samples
             rows[key] = row
-    if not rows or (expected is not None and len(rows) != expected):
+    if (not rows and not failed) or (expected is not None and len(rows) != expected):
         raise RuntimeError(f"expected {expected} episodes, got {len(rows)} in {run}")
     return rows
 

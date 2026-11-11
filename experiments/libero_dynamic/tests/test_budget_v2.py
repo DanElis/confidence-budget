@@ -357,3 +357,15 @@ def test_openpi_arguments_fail_closed(tmp_path):
             parse_args(base + bad)
     with pytest.raises(SystemExit):
         parse_args(["--out", out, "--pairs", "7:0"])  # explicit pairs are for openpi
+
+
+def test_infrastructure_errors_are_collected_for_a_rerun_or_raise(tmp_path):
+    from learn_budget import read_episodes
+
+    (tmp_path / "v0.06").mkdir()
+    (tmp_path / "v0.06/manifest.jsonl").write_text(json.dumps(
+        {"item_id": "a__l1__traj00", "status": "error", "error": "TimeoutError('timed out during handshake')"}) + "\n")
+    failed = []
+    assert read_episodes(tmp_path, None, None, failed=failed) == {} and failed == ["a__l1__traj00"]
+    with pytest.raises(RuntimeError, match="infrastructure error"):
+        read_episodes(tmp_path)
