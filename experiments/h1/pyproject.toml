@@ -1,0 +1,20 @@
+[project]
+name = "confidence-budget-h1"
+version = "0.1.0"
+description = "Offline check of hypothesis H1: cross-attention entropy under RTC guidance"
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot[pi,dataset] @ git+https://github.com/huggingface/lerobot.git@146d8474932c8b566717eb2738ba459337ab71c4",
+    "numpy",
+    "scipy",
+    "matplotlib",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

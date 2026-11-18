@@ -1,0 +1,6 @@
+third_party/
+assets/
+runs/**/*.npz
+runs/smoke*/
+runs/learned*/
+runs/*.lock

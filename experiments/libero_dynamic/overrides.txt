@@ -1,0 +1,4 @@
+# egl-probe (robomimic) compiles against EGL headers with CMake and is only used by LIBERO's training code, not by
+# the simulator; the marker never matches, so it is dropped (same as experiments/libero_pro/pyproject.toml)
+egl-probe; sys_platform == 'never'
+hf-egl-probe; sys_platform == 'never'
