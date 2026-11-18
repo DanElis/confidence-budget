@@ -13,6 +13,11 @@ false is LeRobot's RTCProcessor, without it. The weights come from the client, a
 whatever N is.
 
     cd third_party/openpi && .venv/bin/python ../../scripts/openpi_sample_server.py --port 8765
+
+Another model: --config NAME --checkpoint DIR (a JAX checkpoint: the samplers here are JAX), --config-module MODULE when
+the config is not in openpi's registry (MODULE.get_train_config(NAME), e.g. velocity_debias.openpi_configs), --norm-stats
+DIR when the checkpoint has no assets (DIR holds norm_stats.json). experiments/mimicgen/profile.sh sets them for
+vdb_pi05_threading_d0 (H = 50).
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import argparse
 import logging
 import time
 import types
+from pathlib import Path
 
 import einops
 import jax
@@ -192,10 +198,29 @@ def main() -> None:
 
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--config", default=CONFIG)
+    p.add_argument("--checkpoint", default=CHECKPOINT, help="JAX checkpoint directory (or gs:// path)")
+    p.add_argument("--config-module", default=None, help="module with get_train_config(name), for configs outside openpi")
+    p.add_argument("--norm-stats", default=None, help="directory with norm_stats.json (default: the checkpoint's assets)")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, force=True)
-    config = _config.get_config(CONFIG)
-    policy = policy_config.create_trained_policy(config, CHECKPOINT)
+    if args.config_module:
+        import importlib
+
+        config = importlib.import_module(args.config_module).get_train_config(args.config)
+    else:
+        config = _config.get_config(args.config)
+    norm_stats = None
+    if args.norm_stats:
+        from openpi.shared import normalize
+
+        norm_stats = normalize.load(args.norm_stats)
+    checkpoint = args.checkpoint if args.checkpoint.startswith("gs://") else str(Path(args.checkpoint).expanduser())
+    if not checkpoint.startswith("gs://") and (Path(checkpoint) / "model.safetensors").exists():
+        raise SystemExit(f"{checkpoint} is a PyTorch checkpoint: the samplers here are JAX, give the JAX one")
+    policy = policy_config.create_trained_policy(config, checkpoint, norm_stats=norm_stats)
+    logging.info("config %s, checkpoint %s: H = %d, action_dim = %d", args.config, checkpoint,
+                 config.model.action_horizon, config.model.action_dim)
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=SamplePolicy(policy, config.model.action_horizon, config.model.action_dim),
         host="127.0.0.1", port=args.port, metadata=policy.metadata,

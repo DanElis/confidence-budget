@@ -29,6 +29,11 @@ chunk log (budget_x, budget_action, budget_prob, budget_decision), read by openp
     python scripts/eval_openpi.py --suites pos:x0.2 --signal aac --n-samples 20 --out runs/openpi_aac --port 8765
     python scripts/eval_openpi.py --suites pos:x0.2 --stride 4 --delay 4 --guidance paper --out runs/openpi_rtc --port 8765
     python scripts/eval_openpi.py --suites pos:y0.2 --stride 5 --delay 4 --guidance paper --rtc-gate divergence --rtc-tau 0.1 ...
+
+--env mimicgen (default: the EVAL_ENV variable, else libero): MimicGen through ../mimicgen/mimicgen_env.py, in a venv with
+robosuite 1.4.1 and MimicGen (experiments/mimicgen/profile.sh). A suite is a set of scenes (mg:y1, or the stage scripts'
+pos:y0.1 read as a label), a task a block of scenes, an init state a scene of the block. H = 50, 224 x 224 images and
+400 steps by default; every mode above works as on LIBERO.
 """
 
 from __future__ import annotations
@@ -52,6 +57,7 @@ import torch  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT.parent / "mimicgen"))
 
 from aac import paper_h_star  # noqa: E402
 from closed_loop import Chunk, LoopConfig, run_batch, switch_jumps  # noqa: E402
@@ -67,6 +73,7 @@ RESOLUTION = 256  # LIBERO_ENV_RESOLUTION of openpi's and the AAC authors' clien
 SAMPLE_TOLERANCE = 0.05  # normalised units: sample 0 of a batch against the same noise alone
 GUIDANCE_PROBE_SHIFT = 1.0  # normalised units: how far from the free plan check_guidance puts its target
 GUIDANCE_PROBE_MAX = 0.9  # share of that distance the frozen actions may keep, on average
+EVAL_ENV = os.environ.get("EVAL_ENV", "libero")
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -78,7 +85,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--first-episode", type=int, default=0,
                    help="first init state: episodes first .. first + episodes-per-task - 1 (new scenes of a task)")
     p.add_argument("--batch-size", type=int, default=10)
-    p.add_argument("--max-steps", type=int, default=MAX_STEPS)
+    p.add_argument("--max-steps", type=int, default=None, help=f"default {MAX_STEPS} (LIBERO), 400 (MimicGen)")
     p.add_argument("--stride", type=int, default=None, help="constant step; with --signal aac leave it out")
     p.add_argument("--signal", choices=["aac"], default=None, help="aac: the step from aac.py, s = max(h* - d, d)")
     p.add_argument("--n-samples", type=int, default=1, help="N samples per request; sample 0 is executed")
@@ -92,13 +99,28 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--rtc-share", type=float, default=None, help="random: probability to guide")
     p.add_argument("--budget", type=Path, default=None,
                    help="JSON config of openpi_budget.py: the step per option, naive switching; no --stride")
-    p.add_argument("--horizon", type=int, default=HORIZON, help="H the server must return")
-    p.add_argument("--resolution", type=int, default=RESOLUTION)
+    p.add_argument("--horizon", type=int, default=None, help=f"H the server must return; default {HORIZON} (LIBERO), 50 (MimicGen)")
+    p.add_argument("--resolution", type=int, default=None, help=f"default {RESOLUTION} (LIBERO), 224 (MimicGen)")
+    p.add_argument("--env", choices=["libero", "mimicgen"], default=EVAL_ENV)
+    p.add_argument("--mg-hdf5", type=Path, default=None, help="MimicGen dataset whose env_args build the environment")
+    p.add_argument("--mg-tasks", type=int, default=None, help="MimicGen: blocks of scenes per suite (default 10)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--seed", type=int, default=0, help="of the noise")
     p.add_argument("--out", type=Path, required=True)
     a = p.parse_args(argv)
+    if a.env == "mimicgen":
+        import mimicgen_env as mg
+
+        defaults = {"horizon": mg.HORIZON, "resolution": mg.RESOLUTION, "max_steps": mg.MAX_STEPS,
+                    "mg_hdf5": mg.DEFAULT_HDF5, "mg_tasks": mg.N_BLOCKS}
+    else:
+        if a.mg_hdf5 is not None or a.mg_tasks is not None:
+            p.error("--mg-hdf5 and --mg-tasks need --env mimicgen")
+        defaults = {"horizon": HORIZON, "resolution": RESOLUTION, "max_steps": MAX_STEPS}
+    for k, v in defaults.items():
+        if getattr(a, k) is None:
+            setattr(a, k, v)
     # A chunk runs for s + d steps and the next inference must start after the previous switch: d <= s <= H - d.
     if a.budget is not None:
         if a.stride is not None or a.signal is not None or a.n_samples != 1 or a.guidance != "none":
@@ -249,14 +271,16 @@ class RtcGate:
 
 
 def make_infer(client, prompt: str, horizon: int, n_samples: int = 1, aac: bool = False, rtc_weights=None,
-               max_weight: float = 10.0, jacobian: bool = False, gate: RtcGate | None = None):
+               max_weight: float = 10.0, jacobian: bool = False, gate: RtcGate | None = None, element_fn=None):
     """rtc_weights (paper_weights, make_rtc_weights): guide toward the old plan, which is then kept in model units.
-    gate: first the unguided chunk, then guidance only where the gate says so."""
+    gate: first the unguided chunk, then guidance only where the gate says so. element_fn: observation -> request
+    (default make_element, LIBERO)."""
+    element_fn = element_fn or make_element
 
     def infer(observations, noise, leftover, delay, mask_end) -> Chunk:
         rows, plans, signal, divergence, guided, calls = [], [], [], [], [], []
         for i, (obs, row) in enumerate(zip(observations, noise)):
-            element = make_element(obs, prompt) | {"noise": expand_noise(row[None], n_samples).numpy()}
+            element = element_fn(obs, prompt) | {"noise": expand_noise(row[None], n_samples).numpy()}
             rtc = {}
             if leftover is not None:
                 rtc = {"rtc_target": leftover[i].numpy(), "rtc_weights": rtc_weights(delay, int(mask_end[i])),
@@ -296,12 +320,13 @@ def probe_element() -> dict:
 
 
 def check_guidance(client, rtc_weights, delay: int, horizon: int, max_weight: float, jacobian: bool = False,
-                   action_dim: int = MODEL_ACTION_DIM) -> tuple[float, float]:
+                   action_dim: int = MODEL_ACTION_DIM, probe: dict | None = None) -> tuple[float, float]:
     """On the real model: zero weights must change nothing, and guidance must move the frozen actions toward the target.
 
     Only "toward": with the Jacobian the pull is much weaker than without it (RMSE 0.043 against 0.004 on LeRobot).
     """
-    element = probe_element() | {"noise": np.random.default_rng(0).standard_normal((1, horizon, action_dim), dtype=np.float32)}
+    element = (probe or probe_element()) | {"noise": np.random.default_rng(0).standard_normal((1, horizon, action_dim),
+                                                                                       dtype=np.float32)}
     free = np.asarray(client.infer(element)["normalized_action"])[0]
     target = free + GUIDANCE_PROBE_SHIFT
 
@@ -320,9 +345,10 @@ def check_guidance(client, rtc_weights, delay: int, horizon: int, max_weight: fl
     return unmasked, frozen
 
 
-def check_samples(client, n_samples: int, horizon: int, action_dim: int = MODEL_ACTION_DIM) -> float:
+def check_samples(client, n_samples: int, horizon: int, action_dim: int = MODEL_ACTION_DIM,
+                  probe: dict | None = None) -> float:
     """The batch must behave as single requests: sample 0 as with its noise alone, and the samples must differ."""
-    element = probe_element()
+    element = probe or probe_element()
     noise = np.random.default_rng(0).standard_normal((n_samples, horizon, action_dim), dtype=np.float32)
     many = np.asarray(client.infer(element | {"noise": noise})["normalized_action"])
     one = np.asarray(client.infer(element | {"noise": noise[:1]})["normalized_action"])
@@ -346,7 +372,9 @@ def progress_key(args) -> dict:
         names += ["budget_config"]  # its content, not the file name
     if getattr(args, "first_episode", 0):
         names += ["first_episode"]  # only when set: progress files of earlier runs stay valid
-    return {k: getattr(args, k) for k in names}
+    if getattr(args, "env", "libero") != "libero":
+        names += ["env", "mg_hdf5"]
+    return {k: str(v) if isinstance(v, Path) else v for k, v in ((k, getattr(args, k)) for k in names)}
 
 
 def load_progress(path: Path, key: dict) -> tuple[list, list, list, float]:
@@ -365,28 +393,83 @@ def save_progress(path: Path, key: dict, episodes: list, batches: list, chunks: 
     os.replace(tmp, path)
 
 
+class LiberoBackend:
+    """LIBERO / LIBERO-PRO suites through lerobot's LiberoEnv."""
+
+    policy = "openpi pi05_libero"
+
+    def __init__(self, args):
+        import_libero_quietly()
+        from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
+        from lerobot.envs.libero import LiberoEnv
+        from lerobot.envs.utils import parse_camera_names
+        from libero.libero import benchmark
+
+        self._args, self._env_class, self._benchmark = args, LiberoEnv, benchmark
+        self.suites = resolve_suites(args.suites, args.libero_pro_root)
+        self._env_cfg = LiberoEnvConfig(task=self.suites[0], episode_length=args.max_steps,
+                                        observation_height=args.resolution, observation_width=args.resolution)
+        self._camera_names = parse_camera_names(self._env_cfg.camera_name)
+        self._suite, self._name = None, None
+        self.make_element, self.probe = make_element, None
+
+    def open(self, name: str) -> list[int]:
+        self._name, self._suite = name, self._benchmark.get_benchmark_dict()[name]()
+        return list(range(self._suite.n_tasks))
+
+    def prompt(self, tid: int) -> str:
+        return self._suite.get_task(tid).language
+
+    def make_envs(self, tid: int, ids: list[int]) -> list:
+        return [self._env_class(task_suite=self._suite, task_id=tid, task_suite_name=self._name,
+                                camera_name=self._camera_names, init_states=True, episode_length=self._args.max_steps,
+                                episode_index=i, n_envs=1, **self._env_cfg.gym_kwargs) for i in ids]
+
+
+class MimicGenBackend:
+    """MimicGen scenes through ../mimicgen/mimicgen_env.py: a suite is a scene set, a task a block of scenes."""
+
+    def __init__(self, args):
+        import mimicgen_env as mg
+
+        self._mg, self._args = mg, args
+        self.suites = mg.resolve_suites(args.suites)
+        self._meta = mg.load_env_meta(args.mg_hdf5)
+        self.policy = f"openpi, MimicGen {self._meta['env_name']}"
+        self.make_element, self.probe = mg.make_element, mg.probe_element(args.resolution)
+        self._name = None
+        log.info("MimicGen %s from %s, %d blocks per scene set", self._meta["env_name"], args.mg_hdf5, args.mg_tasks)
+
+    def open(self, name: str) -> list[int]:
+        self._name = name
+        return list(range(self._args.mg_tasks))
+
+    def prompt(self, tid: int) -> str:
+        return self._mg.PROMPT
+
+    def make_envs(self, tid: int, ids: list[int]) -> list:
+        return [self._mg.MimicGenEnv(self._meta, self._mg.scene_seed(self._name, tid, i), self._args.resolution)
+                for i in ids]
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
-    import_libero_quietly()
-    from lerobot.envs.configs import LiberoEnv as LiberoEnvConfig
-    from lerobot.envs.libero import LiberoEnv
-    from lerobot.envs.utils import parse_camera_names
-    from libero.libero import benchmark
-
-    suites = resolve_suites(args.suites, args.libero_pro_root)
+    backend = MimicGenBackend(args) if args.env == "mimicgen" else LiberoBackend(args)
+    suites, element_fn, probe = backend.suites, backend.make_element, backend.probe
     client = OpenPiClient(args.host, args.port)
     log.info("server metadata: %s", client.metadata)
     aac = args.signal == "aac"
     if args.n_samples > 1:
         log.info("sample 0 of %d against the same noise alone: max diff %.4f", args.n_samples,
-                 check_samples(client, args.n_samples, args.horizon))
+                 check_samples(client, args.n_samples, args.horizon, probe=probe))
     rtc_weights, jacobian = None, args.guidance == "paper"
     if args.guidance != "none":
         rtc_weights = ((lambda delay, end: paper_weights(delay, end, args.horizon)) if jacobian
                        else make_rtc_weights(args.schedule, args.max_guidance_weight, args.horizon))
         log.info("RTC check: zero weights differ by %.4f, frozen actions %.4f from the target",
-                 *check_guidance(client, rtc_weights, args.delay, args.horizon, args.max_guidance_weight, jacobian))
+                 *check_guidance(client, rtc_weights, args.delay, args.horizon, args.max_guidance_weight, jacobian,
+                                 probe=probe))
     gate = None
     if args.rtc_gate != "none":
         gate = RtcGate(args.rtc_gate, args.horizon - args.stride, args.rtc_tau or 0.0, args.rtc_share or 0.0, args.seed)
@@ -401,21 +484,18 @@ def main() -> None:
         if runtime.uses_rtc:  # RTC of the paper on the pairs with r >= 0
             log.info("RTC check: zero weights differ by %.4f, frozen actions %.4f from the target",
                      *check_guidance(client, lambda delay, end: paper_weights(delay, end, args.horizon), args.delay,
-                                     args.horizon, 5.0, True))
+                                     args.horizon, 5.0, True, probe=probe))
     elif aac:
         planner = AdaptivePlanner(args.horizon, GivenHStar(), s_min=1)
     else:
         planner = FixedPlanner(args.horizon, args.stride, args.mask_end)
     guided = rtc_weights is not None or (runtime is not None and runtime.uses_rtc)  # the loop passes the old plan
     cfg = LoopConfig(args.horizon, args.delay, guided, args.max_steps, args.seed)
-    env_cfg = LiberoEnvConfig(task=suites[0], episode_length=args.max_steps, observation_height=args.resolution,
-                              observation_width=args.resolution)
-    camera_names = parse_camera_names(env_cfg.camera_name)
     noise_shape = (args.horizon, MODEL_ACTION_DIM)
 
     args.out.mkdir(parents=True, exist_ok=True)
     meta = {k: str(v) for k, v in vars(args).items()} | {"horizon": args.horizon, "max_steps": args.max_steps,
-                                                          "planner_repr": repr(planner), "policy": "openpi pi05_libero"}
+                                                          "planner_repr": repr(planner), "policy": backend.policy}
     (args.out / "config.json").write_text(json.dumps(meta, indent=2))
 
     for name in suites:
@@ -423,8 +503,8 @@ def main() -> None:
         if out_file.exists():
             log.info("skip %s (done)", name)
             continue
-        suite = benchmark.get_benchmark_dict()[name]()
-        task_ids = args.task_ids if args.task_ids is not None else list(range(suite.n_tasks))
+        all_tasks = backend.open(name)
+        task_ids = args.task_ids if args.task_ids is not None else all_tasks
         progress = args.out / f"{name}.progress.json"  # a stopped suite resumes after its last finished task
         key = progress_key(args)
         episodes, batches, chunk_log, seconds = load_progress(progress, key)
@@ -435,19 +515,17 @@ def main() -> None:
         for tid in task_ids:
             if tid in finished:
                 continue
-            task = suite.get_task(tid)
+            prompt = backend.prompt(tid)
             if runtime is not None:
-                infer = make_budget_infer(client, task.language, args.horizon, runtime, make_element,
+                infer = make_budget_infer(client, prompt, args.horizon, runtime, element_fn,
                                           lambda delay, end: paper_weights(delay, end, args.horizon))
             else:
-                infer = make_infer(client, task.language, args.horizon, args.n_samples, aac, rtc_weights,
-                                   args.max_guidance_weight, jacobian, gate)
+                infer = make_infer(client, prompt, args.horizon, args.n_samples, aac, rtc_weights,
+                                   args.max_guidance_weight, jacobian, gate, element_fn)
             last = args.first_episode + args.episodes_per_task
             for start in range(args.first_episode, last, args.batch_size):
                 ids = list(range(start, min(start + args.batch_size, last)))
-                envs = [LiberoEnv(task_suite=suite, task_id=tid, task_suite_name=name, camera_name=camera_names,
-                                  init_states=True, episode_length=args.max_steps, episode_index=i, n_envs=1,
-                                  **env_cfg.gym_kwargs) for i in ids]
+                envs = backend.make_envs(tid, ids)
                 try:
                     res = run_batch(envs, infer, cfg, planner, [tid * 1000 + i for i in ids], noise_shape,
                                     keep_entropy=gate is not None or runtime is not None)  # extras -> chunk log
@@ -458,13 +536,16 @@ def main() -> None:
                 for b, i in enumerate(ids):
                     strides = [c["stride"] for c in res.chunks if c["env"] == b]
                     hs = [c["h_star"] for c in res.chunks if c["env"] == b and c["h_star"] is not None]
-                    episodes.append({
+                    episode = {
                         "task_id": tid, "init_state": i, "success": bool(res.success[b]),
                         "length": int(res.length[b]), "n_inference": int(res.n_inference[b]),
                         "sparc": episode_sparc(res.actions[b]),
                         "mean_stride": float(np.mean(strides)) if strides else None,
                         "mean_h_star": float(np.mean(hs)) if hs else None, "frac_sel": None,
-                    })
+                    }
+                    if getattr(envs[b], "init_hash", None) is not None:  # MimicGen: the scene, to check pairing
+                        episode["init_hash"] = int(envs[b].init_hash)
+                    episodes.append(episode)
                 batches.append({"task_id": tid, "init_states": ids, "jump_at_switch": jump_switch,
                                 "jump_other": jump_other})
                 for c in res.chunks:

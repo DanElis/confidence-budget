@@ -34,7 +34,7 @@ mkdir -p "$OUT"
 local p s r runs=() strides=""
 for p in $PAIRS; do
   s=${p%%:*}; r=${p##*:}
-  (( DELAY + r <= 10 - s )) || { echo "pair $p: need d + r <= H - s"; exit 1; }
+  (( DELAY + r <= ${HORIZON:-10} - s )) || { echo "pair $p: need d + r <= H - s"; exit 1; }   # HORIZON: profile.sh
   strides+=" $s"
 done
 for s in $(tr ' ' '\n' <<< "$strides" | sort -nu); do

@@ -22,7 +22,11 @@ mkdir -p "$RUNS"
 Y_LEVELS="pos:y0.1,pos:y0.2,pos:y0.3"            # tuning
 X_LEVELS="libero_object,pos:x0.1,pos:x0.2,pos:x0.3"   # final report
 
-suite_dir_name() {  # pos:x0.2 -> libero_object_pos_x0.2
+suite_dir_name() {  # pos:x0.2 -> libero_object_pos_x0.2; with EVAL_ENV=mimicgen a scene set: mimicgen_x0.2 (mimicgen_env.py)
+  if [[ ${EVAL_ENV:-libero} == mimicgen ]]; then
+    case "$1" in mg:*|pos:*) echo "mimicgen_${1#*:}";; mimicgen_*) echo "$1";; *) echo "mimicgen_$1";; esac
+    return
+  fi
   case "$1" in pos:*) echo "libero_object_pos_${1#pos:}";; *) echo "$1";; esac
 }
 

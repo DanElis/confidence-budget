@@ -26,13 +26,13 @@ LEVELS=${LEVELS:-"pos:x0.1 pos:x0.2 pos:x0.3"}
 SERVERS_FREE_MB=${SERVERS_FREE_MB:-45000}   # for all servers together, N = 20 per call
 OPENPI=$PWD/third_party/openpi
 SERVER_SCRIPT=$PWD/scripts/openpi_sample_server.py
-OPENPI_PY="uv run --with websockets>=15 --with msgpack python"
+OPENPI_PY=${OPENPI_PY:-"uv run --with websockets>=15 --with msgpack python"}   # experiments/mimicgen/profile.sh: its venv
 REPORT=$RUNS/openpi_aac_async_report.md
 SERVER_PIDS=()
 
 start_server() {  # start_server PORT
   ( cd "$OPENPI" && exec env -u VIRTUAL_ENV XLA_PYTHON_CLIENT_PREALLOCATE=false CUDA_VISIBLE_DEVICES="${GPU:-0}" \
-      .venv/bin/python "$SERVER_SCRIPT" --port "$1" ) > "$RUNS/openpi_aac_async_server_$1.log" 2>&1 &
+      "${OPENPI_SERVER_PY:-.venv/bin/python}" "$SERVER_SCRIPT" --port "$1" ${SERVER_ARGS:-} ) > "$RUNS/openpi_aac_async_server_$1.log" 2>&1 &
   local pid=$!
   SERVER_PIDS+=("$pid")
   disown "$pid"  # outside lib.sh's job count and its final wait
@@ -72,7 +72,7 @@ trap 'trap - INT TERM; stop_servers; kill 0' INT TERM
 trap stop_servers EXIT
 echo "$(date '+%F %T') openpi_aac_async: delays=$DELAYS K=$K EPISODES=$EPISODES seed=$SEED levels=$LEVELS"
 git log -1 --oneline
-[[ -x $OPENPI/.venv/bin/python ]] || { echo "no $OPENPI/.venv: run scripts/setup_openpi.sh"; exit 1; }
+[[ -x ${OPENPI_SERVER_PY:-$OPENPI/.venv/bin/python} ]] || { echo "no ${OPENPI_SERVER_PY:-$OPENPI/.venv/bin/python}: run scripts/setup_openpi.sh"; exit 1; }
 MIN_FREE_MB=$SERVERS_FREE_MB wait_for_gpu
 local level port=$PORT d s steps
 for level in $LEVELS; do start_server "$port" || exit 1; port=$(( port + 1 )); done
