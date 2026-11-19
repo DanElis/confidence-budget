@@ -80,7 +80,7 @@ def test_args_defaults_and_bounds(monkeypatch):
 
 
 class StubRobosuiteEnv:
-    """Placement from numpy's global generator, as robosuite 1.4; success when the summed x action exceeds 1."""
+    """Placement from numpy's global generator, as robosuite 1.4; success when the summed x action exceeds 1 (strictly)."""
 
     def __init__(self, **kwargs):
         self.kwargs, self.total, self.closed = kwargs, 0.0, False
@@ -141,7 +141,7 @@ class FakeClient:
         self.prompts.append(element["prompt"])
         assert element["observation/state"].shape == (8,)
         actions = np.zeros((1, H, 7), dtype=np.float32)
-        actions[..., 0] = 0.1
+        actions[..., 0] = 0.125  # exact in float32: the sum is exactly 1 after 8 steps
         return {"actions": actions, "normalized_action": np.zeros((1, H, 32), dtype=np.float32)}
 
 
@@ -150,6 +150,6 @@ def test_closed_loop_over_stub(stub_robosuite):
     infer = make_infer(client, mg.PROMPT, H, element_fn=mg.make_element)
     envs = [mg.MimicGenEnv(META, mg.scene_seed("mimicgen_y1", 0, i)) for i in range(2)]
     res = run_batch(envs, infer, LoopConfig(H, 2, False, 30), FixedPlanner(H, 10), [0, 1], (H, 32))
-    assert res.success.all() and (res.length == 11).all()  # 0.1 per step: the sum passes 1 at step 11
+    assert res.success.all() and (res.length == 9).all()  # 0.125 per step: the sum passes 1 at the 9th step
     assert set(client.prompts) == {mg.PROMPT}
     assert all(env.init_hash is not None for env in envs)
