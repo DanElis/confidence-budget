@@ -15,7 +15,8 @@
 # The default venv for both is the one the model was trained and evaluated with (MG_VENV). Any variable set before
 # sourcing wins.
 MG_VENV=${MG_VENV:-$HOME/work/cv/tmp/velocity-debias/.venv}
-MG_CKPT=${MG_CKPT:-$HOME/vdb/checkpoints/vdb_pi05_threading_d0/seed42_10k/9999}   # merged JAX (the server is JAX)
+# merged JAX (the server is JAX): the final 30k model; the 10k one is .../seed42_10k/9999 (40% at s = 10, its own eval)
+MG_CKPT=${MG_CKPT:-$HOME/vdb/checkpoints/vdb_pi05_threading_d0/seed42_30k/29999}
 MG_NORM=${MG_NORM:-$HOME/vdb/assets/vdb_pi05_threading_d0_lora/local/mimicgen_threading_d0}
 export EVAL_ENV=mimicgen
 export OPENPI_SERVER_PY=${OPENPI_SERVER_PY:-$MG_VENV/bin/python}
